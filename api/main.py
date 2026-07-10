@@ -356,6 +356,76 @@ async def get_pipeline(pipeline_id: str):
     return state
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ▼ METRICS SECTION - Monitoring endpoints (separated from business logic) ▼
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def get_queue_depth(queue_name: str) -> int:
+    """Get message count in a specific queue.
+    
+    Args:
+        queue_name: Name of the queue (e.g., 'jobs.worker_a')
+    
+    Returns:
+        Number of messages in the queue
+    """
+    try:
+        channel = await get_amqp_channel()
+        queue = await channel.get_queue(queue_name, ensure=False)
+        if queue:
+            return queue.declaration_result.method.message_count
+        return 0
+    except Exception as e:
+        logger.warning(f"Could not get queue depth for {queue_name}: {e}")
+        return 0
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """
+    Get real-time metrics for monitoring.
+    
+    Returns metrics about queue depths (jobs waiting) across all workers.
+    Used by the monitoring dashboard and terminal monitor.
+    
+    Response format:
+    {
+        "timestamp": "2026-07-10T20:45:30.123456",
+        "queues": {
+            "jobs.worker_a": 5,
+            "jobs.worker_b": 3,
+            "jobs.worker_c": 8
+        },
+        "total_jobs_waiting": 16
+    }
+    """
+    try:
+        queues = {}
+        for worker in AVAILABLE_WORKERS:
+            queue_name = f"jobs.{worker}"
+            depth = await get_queue_depth(queue_name)
+            queues[queue_name] = depth
+        
+        total_jobs = sum(queues.values())
+        
+        return {
+            "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+            "queues": queues,
+            "total_jobs_waiting": total_jobs,
+        }
+    except Exception as e:
+        logger.error(f"Error collecting metrics: {e}")
+        return {
+            "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+            "error": str(e),
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ▲ METRICS SECTION - Monitoring endpoints (separated from business logic) ▲
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
