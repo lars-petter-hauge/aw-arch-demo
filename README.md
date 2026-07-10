@@ -15,6 +15,7 @@ In monolithic architectures, the backend both serves the API and runs compute mo
 2. ✅ Use AMQP (a proper message broker protocol) instead of Redis LPUSH/BRPOP
 3. ✅ Deploy identical code to both local (RabbitMQ) and production (Azure Service Bus on Radix)
 4. ✅ Auto-scale workers based on queue depth using KEDA
+5. ✅ Make pipelines **generic** - support any number of models in any order without code changes
 
 ## Architecture
 
@@ -29,7 +30,7 @@ In monolithic architectures, the backend both serves the API and runs compute mo
                         ┌──────────────┐              ┌──────────────┐
                         │  Worker A    │              │  Worker B    │
                         │  (~1s CPU)   │              │  (~25s CPU)  │
-                        │  1 replica   │              │  1 replica   │
+                        │  1+ replicas │              │  1+ replicas │
                         └──────────────┘              └──────────────┘
                         (scales 0-10)                 (scales 0-10)
 
@@ -40,11 +41,10 @@ Results Cache: Redis (in-memory, for fast polling)
 
 | Component | Description |
 |-----------|-------------|
-| **API** | FastAPI server listening on port 8000. Exposes endpoints to trigger pipeline runs and check status. Does NOT run models itself—all compute is offloaded. |
-| **RabbitMQ** (local) / **Azure Service Bus** (prod) | AMQP 0.9.1 (local) or AMQP 1.0 (prod). Jobs published to `jobs` exchange with routing keys `jobs.worker_a` and `jobs.worker_b`. |
+| **API** | FastAPI server listening on port 8000. Accepts generic pipeline requests with model list and iteration count. Does NOT run models itself—all compute is offloaded. |
+| **RabbitMQ** (local) / **Azure Service Bus** (prod) | AMQP 0.9.1 (local) or AMQP 1.0 (prod). Jobs published to `jobs` exchange with routing keys `jobs.{model_name}`. |
 | **Redis** | In-memory result cache. Stores job results at `result:{job_id}`. API polls here for completion. |
-| **Worker A** | Lightweight compute worker. Consumes from `jobs.worker_a` queue. Burns ~1 second of CPU (single core, 100%). Represents fast operations (e.g., data prep). |
-| **Worker B** | Heavy compute worker. Consumes from `jobs.worker_b` queue. Burns ~25 seconds of CPU (single core, 100%). Represents slow operations like NeqSim simulations. |
+| **Workers** (generic) | N workers consuming from `jobs.{model_name}` queues. Each worker processes jobs, burns CPU, stores results, and acknowledges completion. Add new workers by adding their names to the pipeline request. |
 
 ### Why AMQP over Redis LPUSH/BRPOP?
 
@@ -63,23 +63,38 @@ Results Cache: Redis (in-memory, for fast polling)
 
 ### Workflow
 
-The API orchestrates a **pipeline of 10 sequential iterations**:
+The API orchestrates a **generic pipeline of N iterations across M models**:
 
 ```
-Iteration 1: Job_A1 → wait → Job_B1 → wait
-Iteration 2: Job_A2 → wait → Job_B2 → wait
+Iteration 1: Model_1 → Model_2 → ... → Model_M → store results
+Iteration 2: Model_1 → Model_2 → ... → Model_M → store results
 ...
-Iteration 10: Job_A10 → wait → Job_B10 → wait
+Iteration N: Model_1 → Model_2 → ... → Model_M → store results
 ```
 
-Each job is published to the AMQP broker. Workers pick them up, burn CPU, store results in Redis, and acknowledge the message. The API polls Redis for results before moving to the next job.
+Within each iteration:
+- Models run **sequentially** (A finishes, B starts)
+- Results **chain**: Model A output becomes Model B input
+- No hardcoding—define models at request time
 
-**Total runtime:** ~10 iterations × (1s + 25s) ≈ 4-5 minutes.
+**Example: 10 iterations with [worker_a, worker_b]**
+- Total runtime: ~10 × (1s + 25s) ≈ 4-5 minutes
+
+**Example: 5 iterations with [worker_a, worker_b, worker_c]**
+- Total runtime: ~5 × (1s + 25s + worker_c_time) ≈ varies
 
 ### API Endpoints
 
 #### `POST /pipeline`
-Trigger a new pipeline run.
+Trigger a new pipeline with custom models and iteration count.
+
+**Request Body:**
+```json
+{
+  "models": ["worker_a", "worker_b"],
+  "iterations": 10
+}
+```
 
 **Response:**
 ```json
@@ -88,25 +103,46 @@ Trigger a new pipeline run.
 }
 ```
 
+**Notes:**
+- `models`: List of worker names (required, non-empty)
+- `iterations`: Number of iterations (required, ≥1)
+- Defaults: `models=["worker_a", "worker_b"]`, `iterations=10`
+
 #### `GET /pipeline/{pipeline_id}`
-Check pipeline status.
+Check pipeline status and retrieve results.
 
 **Response (running):**
 ```json
 {
   "status": "running",
   "iteration": 3,
-  "step": "B",
+  "current_step_index": 0,
+  "current_model": "worker_a",
+  "models": ["worker_a", "worker_b"],
+  "total_iterations": 10,
   "results": [
     {
       "iteration": 1,
-      "a": {"status": "completed", "worker": "A", "cpu_seconds": 1.005},
-      "b": {"status": "completed", "worker": "B", "cpu_seconds": 25.012}
+      "models": {
+        "worker_a": {
+          "status": "completed",
+          "worker": "a",
+          "job_id": "...",
+          "iteration": 1,
+          "cpu_seconds": 1.005
+        },
+        "worker_b": {
+          "status": "completed",
+          "worker": "b",
+          "job_id": "...",
+          "iteration": 1,
+          "cpu_seconds": 25.012
+        }
+      }
     },
     {
       "iteration": 2,
-      "a": {"status": "completed", "worker": "A", "cpu_seconds": 1.003},
-      "b": {"status": "completed", "worker": "B", "cpu_seconds": 25.015}
+      "models": { ... }
     }
   ]
 }
@@ -117,8 +153,18 @@ Check pipeline status.
 {
   "status": "completed",
   "iteration": 10,
-  "step": null,
+  "current_step_index": null,
+  "current_model": null,
+  "models": ["worker_a", "worker_b"],
+  "total_iterations": 10,
   "results": [... all 10 iterations ...]
+}
+```
+
+**Response (not found):**
+```json
+{
+  "error": "not found"
 }
 ```
 
@@ -138,7 +184,7 @@ Health check.
 
 ### Prerequisites
 - Docker & Docker Compose installed
-- ~3 minutes to run full pipeline
+- ~3-5 minutes to run full pipeline (depends on model count and iterations)
 
 ### Quick Start
 
@@ -166,8 +212,8 @@ worker_b_1  | INFO:root:Worker B listening on jobs.worker_b
 
 In a new terminal:
 
+#### Run default pipeline (2 models, 10 iterations):
 ```bash
-# Trigger a pipeline
 PIPELINE_ID=$(curl -s -X POST http://localhost:8000/pipeline | jq -r '.pipeline_id')
 echo "Pipeline ID: $PIPELINE_ID"
 
@@ -175,7 +221,46 @@ echo "Pipeline ID: $PIPELINE_ID"
 curl http://localhost:8000/pipeline/$PIPELINE_ID | jq .
 
 # Keep polling until completed
-watch -n 1 "curl -s http://localhost:8000/pipeline/$PIPELINE_ID | jq '.status, .iteration, .step'"
+watch -n 1 "curl -s http://localhost:8000/pipeline/$PIPELINE_ID | jq '.status, .iteration, .current_model'"
+```
+
+#### Run custom pipeline (2 models, 5 iterations):
+```bash
+PIPELINE_ID=$(curl -s -X POST http://localhost:8000/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{
+    "models": ["worker_a", "worker_b"],
+    "iterations": 5
+  }' | jq -r '.pipeline_id')
+
+curl http://localhost:8000/pipeline/$PIPELINE_ID | jq .
+```
+
+#### Run pipeline with 3+ models:
+```bash
+# First, ensure worker_c, worker_d, etc. are available
+# (add them to docker-compose.yml or build separate containers)
+
+PIPELINE_ID=$(curl -s -X POST http://localhost:8000/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{
+    "models": ["worker_a", "worker_b", "worker_c"],
+    "iterations": 3
+  }' | jq -r '.pipeline_id')
+
+curl http://localhost:8000/pipeline/$PIPELINE_ID | jq .
+```
+
+#### Run single-model pipeline:
+```bash
+PIPELINE_ID=$(curl -s -X POST http://localhost:8000/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{
+    "models": ["worker_a"],
+    "iterations": 20
+  }' | jq -r '.pipeline_id')
+
+curl http://localhost:8000/pipeline/$PIPELINE_ID | jq .
 ```
 
 ### Monitoring with RabbitMQ Management UI
@@ -186,8 +271,10 @@ Open `http://localhost:15672` in your browser:
 
 You'll see:
 - **Exchanges:** `jobs` (DIRECT type)
-- **Queues:** `jobs.worker_a` and `jobs.worker_b`
+- **Queues:** `jobs.worker_a`, `jobs.worker_b`, `jobs.worker_c`, etc.
 - **Messages:** Real-time message flow from API → queue → worker → ack
+
+Watch as models are dynamically added based on your request!
 
 ### Load Testing (Docker Compose)
 
@@ -195,11 +282,26 @@ Create 5 concurrent pipelines:
 
 ```bash
 for i in {1..5}; do
-  curl -s -X POST http://localhost:8000/pipeline &
+  curl -s -X POST http://localhost:8000/pipeline \
+    -H "Content-Type: application/json" \
+    -d '{
+      "models": ["worker_a", "worker_b"],
+      "iterations": 5
+    }' &
 done
 wait
 
 # Watch RabbitMQ UI—you'll see queues fill up and drain
+```
+
+Mix and match model counts:
+
+```bash
+# Trigger varying pipelines
+curl -s -X POST http://localhost:8000/pipeline -H "Content-Type: application/json" -d '{"models": ["worker_a"], "iterations": 20}' &
+curl -s -X POST http://localhost:8000/pipeline -H "Content-Type: application/json" -d '{"models": ["worker_a", "worker_b"], "iterations": 10}' &
+curl -s -X POST http://localhost:8000/pipeline -H "Content-Type: application/json" -d '{"models": ["worker_a", "worker_b", "worker_c"], "iterations": 5}' &
+wait
 ```
 
 ### Docker Compose Environment Variables
@@ -255,7 +357,12 @@ API_URL=$(minikube service api --url)
 echo $API_URL
 
 # Trigger pipeline
-curl -X POST $API_URL/pipeline
+curl -X POST $API_URL/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{
+    "models": ["worker_a", "worker_b"],
+    "iterations": 5
+  }'
 ```
 
 ### Manual Scaling
@@ -284,10 +391,10 @@ helm install keda kedacore/keda --namespace keda --create-namespace
 
 ### How It Works
 
-- **Metric:** Queue length (number of messages in `jobs.worker_a` or `jobs.worker_b`)
+- **Metric:** Queue length for each worker (number of messages in `jobs.{model_name}`)
 - **Scaling Rule:** `desired_replicas = queue_length / queueLength_threshold`
 - **Cool-down:** After queue drains, workers stay for 1 hour before scaling to 0 (avoids rapid cold starts)
-- **Min/Max:** 0 minimum (scale-to-zero), 10 maximum
+- **Min/Max:** 0 minimum (scale-to-zero), 10 maximum per worker
 
 ### Example Scaling Behavior
 
@@ -299,15 +406,43 @@ helm install keda kedacore/keda --namespace keda --create-namespace
 - If 5 messages in queue → 5/2 = **3 replicas** (process ~3 jobs in ~50s)
 - If 10 messages in queue → 10/2 = **5 replicas** (process ~5 jobs in ~50s)
 
+**Worker C** (custom duration, e.g., ~5s):
+- If 20 messages in queue → 20/4 = **5 replicas** (process ~4 jobs each in ~20s)
+
 ### Tuning Sensitivity
 
-Edit `k8s/scaler_worker_a.yaml` and `k8s/scaler_worker_b.yaml`:
+Edit `k8s/scaler_worker_a.yaml`, `k8s/scaler_worker_b.yaml`, etc.:
 
 ```yaml
 metadata:
   queueLength: "5"  # Lower = scale faster (more aggressive)
                     # Higher = scale slower (more conservative)
 ```
+
+### Adding New Worker Scalers
+
+For each new worker (e.g., `worker_c`), create `k8s/scaler_worker_c.yaml`:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: scaler-worker-c
+spec:
+  scaleTargetRef:
+    name: worker-c
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  cooldownPeriod: 3600
+  triggers:
+    - type: rabbitmq
+      metadata:
+        queueName: jobs.worker_c
+        queueLength: "4"
+        connectionFromSecret: rabbitmq-creds
+```
+
+Then apply: `kubectl apply -f k8s/scaler_worker_c.yaml`
 
 ---
 
@@ -423,23 +558,45 @@ PIPELINE_ID=$(curl -s -X POST http://localhost:8000/pipeline | jq -r '.pipeline_
 
 # Poll status every 5s
 for i in {1..60}; do
-  curl -s http://localhost:8000/pipeline/$PIPELINE_ID | jq '.status, .iteration'
+  curl -s http://localhost:8000/pipeline/$PIPELINE_ID | jq '.status, .iteration, .current_model'
   sleep 5
 done
+```
+
+### Test Custom Model Counts
+
+```bash
+# Test 1-model pipeline
+curl -s -X POST http://localhost:8000/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{"models": ["worker_a"], "iterations": 5}' | jq .
+
+# Test 3-model pipeline (requires worker_c setup)
+curl -s -X POST http://localhost:8000/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{"models": ["worker_a", "worker_b", "worker_c"], "iterations": 2}' | jq .
+
+# Test different order
+curl -s -X POST http://localhost:8000/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{"models": ["worker_b", "worker_a"], "iterations": 3}' | jq .
 ```
 
 ### Load Test (stress test auto-scaling)
 
 ```bash
-# Trigger 20 concurrent pipelines
-for i in {1..20}; do
-  curl -s -X POST http://localhost:8000/pipeline > /dev/null &
+# Trigger 20 concurrent pipelines with varying model counts
+for i in {1..5}; do
+  curl -s -X POST http://localhost:8000/pipeline -H "Content-Type: application/json" -d '{"models": ["worker_a"], "iterations": 20}' &
+  curl -s -X POST http://localhost:8000/pipeline -H "Content-Type: application/json" -d '{"models": ["worker_a", "worker_b"], "iterations": 10}' &
+  curl -s -X POST http://localhost:8000/pipeline -H "Content-Type: application/json" -d '{"models": ["worker_a", "worker_b", "worker_c"], "iterations": 5}' &
 done
 wait
 
 # Watch in RabbitMQ UI:
-# - Queues fill rapidly
-# - If using KEDA: workers scale from 1 → 10
+# - Multiple queues: jobs.worker_a, jobs.worker_b, jobs.worker_c
+# - Queues fill based on pipeline requests
+# - If using KEDA: workers scale from 1 → 10 per queue
 # - Queues drain as workers process
 
 # Check logs
@@ -452,7 +609,7 @@ docker-compose logs -f worker_a worker_b
 
 **Queue buildup:** Trigger many pipelines at once. Watch auto-scaling in action (Kubernetes/Radix only).
 
-**Worker timeout:** Increase `BROKER_URL` timeout or set prefetch=1 to ensure one job per worker.
+**Invalid model name:** API publishes to non-existent queue. Results in timeout; job stays in queue.
 
 ---
 
@@ -462,15 +619,15 @@ docker-compose logs -f worker_a worker_b
 aw-arch-demo/
 ├── api/
 │   ├── Dockerfile
-│   ├── main.py              # FastAPI application
+│   ├── main.py              # FastAPI application (generic pipeline)
 │   └── requirements.txt
 ├── worker_a/
 │   ├── Dockerfile
-│   ├── worker.py            # AMQP consumer (fast)
+│   ├── worker.py            # AMQP consumer (fast, ~1s)
 │   └── requirements.txt
 ├── worker_b/
 │   ├── Dockerfile
-│   ├── worker.py            # AMQP consumer (slow)
+│   ├── worker.py            # AMQP consumer (slow, ~25s)
 │   └── requirements.txt
 ├── k8s/                      # Kubernetes manifests
 │   ├── api.yaml
@@ -489,20 +646,43 @@ aw-arch-demo/
 
 ## Code Highlights
 
-### API Publishing Jobs
+### API - Generic Pipeline Request
 
 ```python
 # api/main.py
-async def publish_job(channel: aio_pika.Channel, queue_name: str, job_data: dict):
-    exchange = await channel.get_exchange("jobs")
-    message = aio_pika.Message(body=json.dumps(job_data).encode())
-    await exchange.publish(message, routing_key=queue_name)
+class PipelineRequest(BaseModel):
+    models: List[str] = ["worker_a", "worker_b"]
+    iterations: int = 10
+
+@app.post("/pipeline")
+async def create_pipeline(request: PipelineRequest, background_tasks: BackgroundTasks):
+    # Validates input, enqueues background task
+    background_tasks.add_task(run_pipeline, pipeline_id, request.models, request.iterations)
+    return {"pipeline_id": pipeline_id}
 ```
 
-### Worker Consuming Jobs
+### API - Generic Pipeline Execution
 
 ```python
-# worker_a/worker.py
+# api/main.py
+async def run_pipeline(pipeline_id: str, models: List[str], iterations: int):
+    """Orchestrate N iterations across M models."""
+    for i in range(iterations):
+        for step_index, model in enumerate(models):
+            job_id = str(uuid.uuid4())
+            job_data = {"job_id": job_id, "iteration": i+1, "step": step_index, "model": model}
+            if previous_result:
+                job_data["input"] = previous_result
+            await publish_job(channel, model, job_data)
+            result = await wait_for_result(r, job_id, timeout=WORKER_TIMEOUTS[model])
+            iteration_results[model] = result
+            previous_result = result
+```
+
+### Worker - Generic AMQP Consumer
+
+```python
+# worker_a/worker.py (or any worker_n/worker.py)
 async for message in queue_iter:
     async with message.process():  # Auto-ack on success, nack on exception
         job = json.loads(message.body.decode())
@@ -527,14 +707,19 @@ RESULT_CACHE_URL=redis://redis:6379           # Redis connection
 
 | Metric | Value |
 |--------|-------|
-| **Pipeline runtime** | ~4-5 minutes (10 × (1s + 25s)) |
-| **Worker A job time** | ~1.0s (tight loop math) |
-| **Worker B job time** | ~25s (tight loop math) |
+| **Pipeline runtime** | ~(N iterations) × Σ(model times) |
+| **Worker A job time** | ~1.0s |
+| **Worker B job time** | ~25s |
 | **Message latency** | <100ms (AMQP publish → worker pickup) |
 | **Result polling** | 200ms interval |
 | **Max concurrent pipelines** | Limited by workers (with auto-scale: unlimited) |
 | **Memory per worker** | ~50MB (single Python process) |
 | **CPU per worker** | 1 core @ 100% during job processing |
+
+**Example runtimes:**
+- 10 iterations × [worker_a (1s) + worker_b (25s)] = 4-5 minutes
+- 5 iterations × [worker_a (1s) + worker_b (25s) + worker_c (5s)] = 3-4 minutes
+- 20 iterations × [worker_a (1s)] = 20-25 seconds
 
 ---
 
@@ -576,6 +761,13 @@ docker-compose exec redis redis-cli
 - Ensure KEDA is installed: `kubectl get deployment -n keda`
 - Check KEDA logs: `kubectl logs -n keda deployment/keda-operator`
 - Verify trigger config in `scaler_worker_*.yaml`
+
+### Invalid model in pipeline request
+
+- API publishes to `jobs.{model_name}` regardless
+- If queue doesn't exist: AMQP auto-creates it (RabbitMQ behavior)
+- If no worker listens: message waits in queue indefinitely
+- Results in timeout: `{"status": "timeout"}` returned to API
 
 ---
 
