@@ -1,0 +1,17 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-b-scaler
+spec:
+  scaleTargetRef:
+    name: worker-b
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  pollingInterval: 5
+  cooldownPeriod: 60
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: queue:worker_b
+        listLength: "1"
