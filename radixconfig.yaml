@@ -20,10 +20,30 @@ spec:
       src: worker_a
       variables:
         REDIS_URL: redis://redis:6379
+      horizontalScaling:
+        minReplicas: 0
+        maxReplicas: 10
+        triggers:
+          - name: queue-length
+            type: redis
+            metadata:
+              address: redis:6379
+              listName: queue:worker_a
+              listLength: "1"
     - name: worker-b
       src: worker_b
       variables:
         REDIS_URL: redis://redis:6379
+      horizontalScaling:
+        minReplicas: 0
+        maxReplicas: 10
+        triggers:
+          - name: queue-length
+            type: redis
+            metadata:
+              address: redis:6379
+              listName: queue:worker_b
+              listLength: "1"
     - name: redis
       image: redis:7-alpine
       ports:

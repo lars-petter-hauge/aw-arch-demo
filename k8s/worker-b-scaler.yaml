@@ -5,7 +5,7 @@ metadata:
 spec:
   scaleTargetRef:
     name: worker-b
-  minReplicaCount: 1
+  minReplicaCount: 0
   maxReplicaCount: 10
   pollingInterval: 5
   cooldownPeriod: 60
