@@ -1,3 +1,4 @@
 fastapi==0.115.0
 uvicorn==0.30.6
+aio-pika==13.0.0
 redis==5.1.0
