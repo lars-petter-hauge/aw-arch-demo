@@ -24,11 +24,16 @@ WORKER_TIMEOUTS = {
     "worker_c": 30.0,
 }
 
+# Available workers (define once at startup)
+AVAILABLE_WORKERS = ["worker_a", "worker_b", "worker_c"]
+
 # In-memory result storage (POC - simple dictionary for demonstration)
 results_store: Dict[str, Dict[str, Any]] = {}
 
 # AMQP connection pool
 amqp_connection = None
+amqp_channel = None
+amqp_exchange = None
 
 
 class PipelineRequest(BaseModel):
@@ -45,10 +50,72 @@ async def get_amqp_connection():
     return amqp_connection
 
 
+async def get_amqp_channel():
+    """Get or create AMQP channel."""
+    global amqp_channel
+    if amqp_channel is None or amqp_channel.is_closed():
+        conn = await get_amqp_connection()
+        amqp_channel = await conn.channel()
+    return amqp_channel
+
+
+async def get_amqp_exchange():
+    """Get or create AMQP exchange."""
+    global amqp_exchange
+    if amqp_exchange is None:
+        channel = await get_amqp_channel()
+        amqp_exchange = await channel.get_exchange("jobs")
+    return amqp_exchange
+
+
+async def setup_amqp_infrastructure():
+    """Initialize AMQP exchange and queues once at startup."""
+    try:
+        logger.info("Setting up AMQP infrastructure...")
+        conn = await get_amqp_connection()
+        channel = await get_amqp_channel()
+        
+        # Create exchange
+        global amqp_exchange
+        amqp_exchange = await channel.declare_exchange(
+            "jobs", aio_pika.ExchangeType.DIRECT, durable=True
+        )
+        logger.info("Exchange 'jobs' created")
+        
+        # Create queues for all workers
+        for worker in AVAILABLE_WORKERS:
+            queue_name = f"jobs.{worker}"
+            queue = await channel.declare_queue(queue_name, durable=True)
+            await queue.bind(amqp_exchange, queue_name)
+            logger.info(f"Queue '{queue_name}' created and bound to exchange")
+        
+        logger.info("AMQP infrastructure setup complete")
+    except Exception as e:
+        logger.error(f"Error setting up AMQP infrastructure: {e}", exc_info=True)
+        raise
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize AMQP infrastructure on app startup."""
+    await setup_amqp_infrastructure()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close AMQP connection on app shutdown."""
+    global amqp_connection, amqp_channel
+    if amqp_channel:
+        await amqp_channel.close()
+    if amqp_connection:
+        await amqp_connection.close()
+    logger.info("AMQP connection closed")
+
+
 async def publish_job(channel: aio_pika.Channel, model_name: str, job_data: dict):
     """Publish a job to AMQP exchange."""
     queue_name = f"jobs.{model_name}"
-    exchange = await channel.get_exchange("jobs")
+    exchange = await get_amqp_exchange()
     message = aio_pika.Message(
         body=json.dumps(job_data).encode(),
         content_type="application/json",
@@ -156,19 +223,8 @@ async def run_pipeline(
     Total time ≈ 1s (first model_a) + N×1s (all model_a) + 25s (final model_b)
     """
     try:
-        # Setup connections
-        conn = await get_amqp_connection()
-        channel = await conn.channel()
-
-        # Declare exchange and all queues
-        exchange = await channel.declare_exchange(
-            "jobs", aio_pika.ExchangeType.DIRECT, durable=True
-        )
-        
-        for model in models:
-            queue_name = f"jobs.{model}"
-            queue = await channel.declare_queue(queue_name, durable=True)
-            await queue.bind(exchange, queue_name)
+        # Get pre-initialized channel (queues already exist)
+        channel = await get_amqp_channel()
 
         # Initialize pipeline state
         state_key = f"pipeline:{pipeline_id}"
