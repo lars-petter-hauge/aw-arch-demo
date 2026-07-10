@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Setting up Kubernetes environment with KIND..."
+echo "🚀 Setting up Kubernetes environment with KIND and KEDA..."
 echo ""
 
 # Colors for output
@@ -16,9 +16,9 @@ REGISTRY_NAME="${CLUSTER_NAME}-registry"
 REGISTRY_PORT="5001"
 NAMESPACE="default"
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # SETUP LOGGING - Track all setup operations
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 LOG_DIR="/tmp/aw-arch-setup"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/setup-$(date +%s).log"
@@ -48,10 +48,10 @@ log_error() {
   local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
   echo "[${timestamp}] [ERROR] ${message}" | tee -a "${LOG_FILE}" >&2
 }
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
 echo ""
-log_step "0" "Starting AW Arch Demo K8s setup"
+log_step "0" "Starting AW Arch Demo K8s setup with KEDA autoscaling"
 echo ""
 
 # Step 1: Check if KIND cluster already exists
@@ -154,9 +154,41 @@ log_success "Loaded worker-c image into KIND cluster"
 
 echo ""
 
-# Step 6: Deploy manifests
-echo -e "${BLUE}Step 6: Deploying Kubernetes manifests...${NC}"
-log_step "6" "Applying K8s manifests (rabbitmq, api, workers)"
+# Step 6: Install KEDA
+echo -e "${BLUE}Step 6: Installing KEDA for queue-based autoscaling...${NC}"
+log_step "6" "Installing KEDA (Kubernetes Event Driven Autoscaling)"
+
+log_info "Checking if Helm is installed"
+if ! command -v helm &> /dev/null; then
+  log_error "Helm is not installed. Please install Helm: https://helm.sh/docs/intro/install/"
+  exit 1
+fi
+
+log_info "Adding KEDA Helm repository"
+helm repo add kedacore https://kedacore.github.io/charts 2>&1 | tee -a "${LOG_FILE}"
+helm repo update 2>&1 | tee -a "${LOG_FILE}"
+
+log_info "Installing KEDA via Helm"
+helm install keda kedacore/keda --namespace keda --create-namespace 2>&1 | tee -a "${LOG_FILE}"
+echo -e "${GREEN}✅ KEDA installed${NC}"
+log_success "KEDA installed successfully"
+
+# Wait for KEDA to be ready
+log_info "Waiting for KEDA operator to be ready"
+kubectl wait --for=condition=available --timeout=300s deployment/keda-operator -n keda 2>&1 | tee -a "${LOG_FILE}" || true
+echo -e "${GREEN}✅ KEDA operator ready${NC}"
+log_success "KEDA operator deployment ready"
+
+log_info "Waiting for KEDA metrics API server to be ready"
+kubectl wait --for=condition=available --timeout=300s deployment/keda-metrics-apiserver -n keda 2>&1 | tee -a "${LOG_FILE}" || true
+echo -e "${GREEN}✅ KEDA metrics API server ready${NC}"
+log_success "KEDA metrics API server deployment ready"
+
+echo ""
+
+# Step 7: Deploy manifests
+echo -e "${BLUE}Step 7: Deploying Kubernetes manifests...${NC}"
+log_step "7" "Applying K8s manifests (rabbitmq, api, workers)"
 
 log_info "Deploying RabbitMQ"
 kubectl apply -f k8s/rabbitmq.yaml 2>&1 | tee -a "${LOG_FILE}"
@@ -175,9 +207,9 @@ log_success "Deployed Workers (A, B, C)"
 
 echo ""
 
-# Step 7: Wait for deployments
-echo -e "${BLUE}Step 7: Waiting for deployments to be ready...${NC}"
-log_step "7" "Waiting for pod readiness (timeout: 5 minutes)"
+# Step 8: Wait for deployments
+echo -e "${BLUE}Step 8: Waiting for deployments to be ready...${NC}"
+log_step "8" "Waiting for pod readiness (timeout: 5 minutes)"
 echo "This may take 1-2 minutes..."
 
 log_info "Waiting for rabbitmq deployment"
@@ -205,9 +237,26 @@ log_success "All deployments ready"
 
 echo ""
 
-# Step 8: Set up port forwarding
-echo -e "${BLUE}Step 8: Setting up port forwarding...${NC}"
-log_step "8" "Configuring kubectl port-forward for API and RabbitMQ"
+# Step 9: Deploy KEDA ScaledObjects
+echo -e "${BLUE}Step 9: Deploying KEDA ScaledObjects for autoscaling...${NC}"
+log_step "9" "Applying KEDA ScaledObjects (worker autoscaling)"
+
+log_info "Deploying KEDA ScaledObjects for queue-based autoscaling"
+kubectl apply -f k8s/keda-scalers.yaml 2>&1 | tee -a "${LOG_FILE}"
+echo -e "${GREEN}✅ Deployed KEDA ScaledObjects${NC}"
+log_success "Deployed KEDA ScaledObjects for worker autoscaling"
+
+# Wait for ScaledObjects to be active
+log_info "Waiting for KEDA ScaledObjects to be active"
+sleep 5
+echo -e "${GREEN}✅ KEDA ScaledObjects active${NC}"
+log_success "KEDA ScaledObjects are now active and monitoring queue depth"
+
+echo ""
+
+# Step 10: Set up port forwarding
+echo -e "${BLUE}Step 10: Setting up port forwarding...${NC}"
+log_step "10" "Configuring kubectl port-forward for API and RabbitMQ"
 echo "Port forwarding in background (PID logged for reference)..."
 
 # Kill any existing port-forwards
@@ -232,9 +281,9 @@ sleep 2
 
 echo ""
 
-# Step 9: Show status
-echo -e "${BLUE}Step 9: Deployment Status${NC}"
-log_step "9" "Final deployment status"
+# Step 11: Show status
+echo -e "${BLUE}Step 11: Deployment Status${NC}"
+log_step "11" "Final deployment status and KEDA configuration"
 echo ""
 echo "Pods:"
 kubectl get pods -o wide 2>&1 | tee -a "${LOG_FILE}"
@@ -242,19 +291,22 @@ echo ""
 echo "Services:"
 kubectl get svc 2>&1 | tee -a "${LOG_FILE}"
 echo ""
+echo "KEDA ScaledObjects:"
+kubectl get scaledobjects 2>&1 | tee -a "${LOG_FILE}"
+echo ""
 
 log_success "Deployment status:"
 kubectl get pods -o wide 2>&1 | grep -E 'NAME|worker|api|rabbitmq' | tee -a "${LOG_FILE}"
 
 echo ""
 
-# Step 10: Ready to use
-echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}✅ Kubernetes environment ready!${NC}"
-echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
+# Step 12: Ready to use
+echo -e "${GREEN}════════════════════════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}✅ Kubernetes environment with KEDA autoscaling ready!${NC}"
+echo -e "${GREEN}════════════════════════════════════════════════════════════════════════════════${NC}"
 echo ""
 
-log_success "Setup complete! Kubernetes environment ready for testing"
+log_success "Setup complete! Kubernetes environment with KEDA ready for testing"
 
 echo -e "${YELLOW}📝 Test the API:${NC}"
 echo ""
@@ -269,33 +321,32 @@ echo "  curl -X POST http://localhost:8000/pipeline \\"
 echo "    -H 'Content-Type: application/json' \\"
 echo "    -d '{\"models\": [\"worker_a\", \"worker_b\"], \"simulations\": 1}'"
 echo ""
-echo "  # Run 10 simulations"
+echo "  # Run 100 simulations (watch KEDA scale workers!)"
 echo "  curl -X POST http://localhost:8000/pipeline \\"
 echo "    -H 'Content-Type: application/json' \\"
-echo "    -d '{\"models\": [\"worker_a\", \"worker_b\", \"worker_c\"], \"simulations\": 10}'"
+echo "    -d '{\"models\": [\"worker_a\", \"worker_b\", \"worker_c\"], \"simulations\": 100}'"
 echo ""
 
 echo -e "${YELLOW}📊 Monitor the deployment:${NC}"
 echo ""
-echo "  # Terminal dashboard (real-time worker + queue stats)"
+echo "  # Terminal dashboard (real-time worker + queue + KEDA scaling)"
 echo "  bash scripts/monitor.sh"
+echo ""
+echo "  # Watch KEDA scaling events in real-time"
+echo "  kubectl get scaledobjects -w"
 echo ""
 echo "  # Get pipeline status"
 echo "  curl http://localhost:8000/pipeline/{pipeline_id}"
 echo ""
-echo "  # Watch pod logs"
-echo "  kubectl logs -f deployment/api"
-echo "  kubectl logs -f deployment/worker-a"
-echo ""
 
 echo -e "${YELLOW}🛠️  Useful kubectl commands:${NC}"
 echo ""
-echo "  kubectl get pods                    # List all pods"
-echo "  kubectl describe pod <pod-name>     # Pod details"
-echo "  kubectl logs <pod-name>             # View pod logs"
-echo "  kubectl exec -it <pod-name> -- bash # Shell into pod"
-echo "  kubectl delete all --all            # Clean up (keeps cluster)"
-echo "  kind delete cluster --name ${CLUSTER_NAME}  # Delete cluster"
+echo "  kubectl get pods                           # List all pods"
+echo "  kubectl get scaledobjects                  # List KEDA scalers"
+echo "  kubectl describe scaledobject worker-a-scaler  # Scaler details"
+echo "  kubectl logs -f deployment/worker-a       # Watch worker logs"
+echo "  kubectl delete all --all                   # Clean up (keeps cluster)"
+echo "  kind delete cluster --name ${CLUSTER_NAME}    # Delete cluster"
 echo ""
 
 echo -e "${YELLOW}🌐 Access RabbitMQ Management:${NC}"
@@ -304,13 +355,29 @@ echo "  Username: guest"
 echo "  Password: guest"
 echo ""
 
-echo -e "${YELLOW}📋 Setup logs:${NC}"
+echo -e "${YELLOW}📋 KEDA Autoscaling Info:${NC}"
+echo "  Scaling Behavior:"
+echo "  - Min replicas: 1 (always at least one worker running)"
+echo "  - Max replicas: 5 (scales up to 5 for high load)"
+echo "  - Scale trigger: Queue depth > 10 messages"
+echo ""
+echo "  Queues monitored:"
+echo "  - Worker A: jobs.worker_a"
+echo "  - Worker B: jobs.worker_b"
+echo "  - Worker C: jobs.worker_c"
+echo ""
+echo "  Check KEDA status:"
+echo "  kubectl get scaledobjects"
+echo "  kubectl describe scaledobject worker-a-scaler"
+echo ""
+
+echo -e "${YELLOW}📁 Setup logs:${NC}"
 echo "  ${LOG_FILE}"
 echo ""
 
 echo -e "${GREEN}Happy testing! 🚀${NC}"
 echo ""
 
-log_success "═══════════════════════════════════════════════════════"
+log_success "════════════════════════════════════════════════════════════════════════════════"
 log_success "Setup script completed successfully"
-log_success "═══════════════════════════════════════════════════════"
+log_success "════════════════════════════════════════════════════════════════════════════════"
