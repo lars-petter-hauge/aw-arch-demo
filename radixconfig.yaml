@@ -1,0 +1,31 @@
+apiVersion: radix.equinor.com/v1
+kind: RadixApplication
+metadata:
+  name: aw-arch-demo
+spec:
+  environments:
+    - name: dev
+      build:
+        from: feature/async-worker-architecture
+  components:
+    - name: api
+      src: api
+      ports:
+        - name: http
+          port: 8000
+      publicPort: http
+      variables:
+        REDIS_URL: redis://redis:6379
+    - name: worker-a
+      src: worker_a
+      variables:
+        REDIS_URL: redis://redis:6379
+    - name: worker-b
+      src: worker_b
+      variables:
+        REDIS_URL: redis://redis:6379
+    - name: redis
+      image: redis:7-alpine
+      ports:
+        - name: redis
+          port: 6379
