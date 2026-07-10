@@ -8,10 +8,10 @@ spec:
   minReplicaCount: 0
   maxReplicaCount: 10
   pollingInterval: 5
-  cooldownPeriod: 30
+  cooldownPeriod: 3600
   triggers:
     - type: redis
       metadata:
         address: redis:6379
         listName: queue:worker_a
-        listLength: "1"
+        listLength: "500"

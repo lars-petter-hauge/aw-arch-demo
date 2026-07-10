@@ -102,13 +102,28 @@ helm install keda kedacore/keda --namespace keda --create-namespace
 
 **How it works:**
 
-- `k8s/worker-a-scaler.yaml` — Scales worker-a from 1 to 10 replicas when `queue:worker_a` has pending jobs
-- `k8s/worker-b-scaler.yaml` — Scales worker-b from 1 to 10 replicas when `queue:worker_b` has pending jobs
+- Workers scale from **0 to 10 replicas** based on queue depth (scale-to-zero when idle)
+- KEDA polls Redis every 5 seconds
+- After the queue drains, workers stay alive for **1 hour** (`cooldownPeriod: 3600`) before scaling back to 0 — this avoids repeated cold starts during bursty workloads
 
-Both scalers poll every 5 seconds. Worker A cools down after 30s of idle, Worker B after 60s (since its jobs take longer).
+**Tuning `listLength` (scaling sensitivity):**
+
+The `listLength` parameter controls how aggressively KEDA scales. It represents the number of queued items per replica — KEDA calculates desired replicas as `queueLength / listLength`.
+
+**Rule of thumb:** set `listLength` to approximately how many jobs one worker can process within one polling interval (5 seconds).
+
+| Worker | Job duration | Jobs/5s/replica | listLength | Effect |
+|--------|-------------|-----------------|------------|--------|
+| Worker A | ~10ms | ~500 | `500` | Only scales up when backlog exceeds what one replica handles in a poll cycle |
+| Worker B | ~25s | ~0.2 | `2` | Scales up quickly since each replica is slow |
+
+**Examples:**
+- 100 jobs in `queue:worker_a` → 100/500 = 0.2 → stays at 1 replica (one worker handles it in <1s)
+- 1000 jobs in `queue:worker_a` → 1000/500 = 2 replicas
+- 10 jobs in `queue:worker_b` → 10/2 = 5 replicas (each takes ~25s, so 5 replicas finish in ~50s)
 
 The scalers are applied automatically with `kubectl apply -f k8s/`.
 
 ## Deployment (Radix)
 
-Deployed to Radix with each component as a separate container, independently scalable. See `radixconfig.yaml`.
+Deployed to Radix with each component as a separate container, independently scalable. The same KEDA scaling logic is configured via `horizontalScaling` in `radixconfig.yaml` — Radix runs KEDA natively.
