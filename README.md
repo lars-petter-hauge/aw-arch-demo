@@ -56,12 +56,38 @@ GET /pipeline/{pipeline_id}
 
 Returns the current state: which iteration we're on, whether each step is pending/running/completed, and final results.
 
-## Running locally
+## Running locally (Docker Compose)
 
 ```bash
 docker-compose up --build
 ```
 
-## Deployment
+The API is available at `http://localhost:8000`.
+
+## Running locally (Kubernetes)
+
+Requires [minikube](https://minikube.sigs.k8s.io/) or [kind](https://kind.sigs.k8s.io/).
+
+```bash
+# Build images
+docker build -t aw-arch-demo-api ./api
+docker build -t aw-arch-demo-worker-a ./worker_a
+docker build -t aw-arch-demo-worker-b ./worker_b
+
+# Load images into minikube
+minikube image load aw-arch-demo-api:latest
+minikube image load aw-arch-demo-worker-a:latest
+minikube image load aw-arch-demo-worker-b:latest
+
+# Deploy
+kubectl apply -f k8s/
+
+# Get the API URL
+minikube service api --url
+```
+
+The API is exposed on NodePort 30080.
+
+## Deployment (Radix)
 
 Deployed to Radix with each component as a separate container, independently scalable. See `radixconfig.yaml`.
