@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-c
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-c
+  template:
+    metadata:
+      labels:
+        app: worker-c
+    spec:
+      containers:
+      - name: worker-c
+        image: aw-arch-demo-worker-c:latest
+        imagePullPolicy: Never
+        env:
+        - name: BROKER_URL
+          value: amqp://guest:guest@rabbitmq:5672/
+        - name: RESULT_CACHE_URL
+          value: redis://redis:6379
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "1000m"

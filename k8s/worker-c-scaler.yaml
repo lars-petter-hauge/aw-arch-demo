@@ -1,0 +1,16 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-c-scaler
+spec:
+  scaleTargetRef:
+    name: worker-c
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  cooldownPeriod: 3600
+  triggers:
+  - type: rabbitmq
+    metadata:
+      queueName: jobs.worker_c
+      queueLength: "4"
+      connectionFromSecret: rabbitmq-creds
