@@ -88,6 +88,27 @@ minikube service api --url
 
 The API is exposed on NodePort 30080.
 
+### Auto-scaling with KEDA
+
+[KEDA](https://keda.sh/) scales workers based on Redis queue length — when jobs pile up, more worker pods are created automatically.
+
+**Install KEDA:**
+
+```bash
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+helm install keda kedacore/keda --namespace keda --create-namespace
+```
+
+**How it works:**
+
+- `k8s/worker-a-scaler.yaml` — Scales worker-a from 1 to 10 replicas when `queue:worker_a` has pending jobs
+- `k8s/worker-b-scaler.yaml` — Scales worker-b from 1 to 10 replicas when `queue:worker_b` has pending jobs
+
+Both scalers poll every 5 seconds. Worker A cools down after 30s of idle, Worker B after 60s (since its jobs take longer).
+
+The scalers are applied automatically with `kubectl apply -f k8s/`.
+
 ## Deployment (Radix)
 
 Deployed to Radix with each component as a separate container, independently scalable. See `radixconfig.yaml`.
