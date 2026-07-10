@@ -32,7 +32,7 @@ amqp_connection = None
 class PipelineRequest(BaseModel):
     """Request body for pipeline execution."""
     models: List[str] = ["worker_a", "worker_b"]  # Model names in sequence
-    iterations: int = 10  # Number of iterations
+    simulations: int = 10  # Number of independent simulations
 
 
 async def get_amqp_connection():
@@ -57,7 +57,6 @@ async def publish_job(channel: aio_pika.Channel, model_name: str, job_data: dict
         content_type="application/json",
     )
     await exchange.publish(message, routing_key=queue_name)
-    logger.info(f"Published job {job_data['job_id']} to {queue_name}")
 
 
 async def wait_for_result(r, job_id: str, timeout: float = 120.0):
@@ -72,14 +71,89 @@ async def wait_for_result(r, job_id: str, timeout: float = 120.0):
     return {"status": "timeout"}
 
 
-async def run_pipeline(
-    pipeline_id: str, models: List[str], iterations: int
+async def run_simulation_pipeline(
+    pipeline_id: str, simulation_id: int, models: List[str], r, channel, state_key: str
 ):
     """
-    Orchestrate a generic pipeline with N iterations across M models.
+    Run a single simulation through the pipeline.
+    Each simulation flows through all models sequentially.
+    Multiple simulations run concurrently.
     
-    For each iteration, models run sequentially (A → B → C → ...).
-    Results from each model feed into the next one.
+    As soon as model_1 completes, model_2 starts immediately (with model_1's output as input).
+    """
+    try:
+        simulation_results = {}
+        previous_result = None
+
+        for step_index, model in enumerate(models):
+            job_id = str(uuid.uuid4())
+            
+            # Build job data
+            job_data = {
+                "job_id": job_id,
+                "simulation": simulation_id,
+                "step": step_index,
+                "model": model,
+            }
+            
+            # If there's a previous result from earlier model in the pipeline, pass it as input
+            if previous_result is not None:
+                job_data["input"] = previous_result
+
+            # Publish job to queue
+            await publish_job(channel, model, job_data)
+            logger.info(
+                f"Pipeline {pipeline_id}: Published simulation {simulation_id} "
+                f"to model {model} (step {step_index + 1}/{len(models)})"
+            )
+            
+            # Get timeout for this worker (default to 120s if not specified)
+            timeout = WORKER_TIMEOUTS.get(model, 120.0)
+            
+            # Wait for THIS simulation's result for this model
+            result = await wait_for_result(r, job_id, timeout=timeout)
+            simulation_results[model] = result
+            previous_result = result
+            
+            logger.info(
+                f"Pipeline {pipeline_id}: Simulation {simulation_id} completed model "
+                f"{model} (step {step_index + 1}/{len(models)})"
+            )
+
+        # Store results for this simulation
+        await r.hset(f"{state_key}:results", f"simulation_{simulation_id}", json.dumps(simulation_results))
+        logger.info(
+            f"Pipeline {pipeline_id}: Simulation {simulation_id} completed all models"
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Error in pipeline {pipeline_id}, simulation {simulation_id}: {e}",
+            exc_info=True
+        )
+        await r.hset(
+            f"{state_key}:results",
+            f"simulation_{simulation_id}",
+            json.dumps({"status": "error", "error": str(e)})
+        )
+
+
+async def run_pipeline(
+    pipeline_id: str, models: List[str], simulations: int
+):
+    """
+    Orchestrate N independent simulations through M models.
+    
+    Each simulation flows through the model pipeline sequentially (A -> B -> C).
+    Multiple simulations run concurrently - as soon as sim_i finishes model_j,
+    it immediately starts model_j+1, while other simulations are also processing.
+    
+    This creates a pipelined parallel execution:
+    SIM 1: model_a [0-1s]      -> model_b [1-26s]
+    SIM 2:            model_a [1-2s]  -> model_b [2-27s]
+    SIM 3:                       model_a [2-3s] -> model_b [3-28s]
+    ...
+    Total time ≈ 1s (first model_a) + N×1s (all model_a) + 25s (final model_b)
     """
     r = None
     try:
@@ -99,80 +173,44 @@ async def run_pipeline(
             await queue.bind(exchange, queue_name)
 
         # Initialize pipeline state
+        state_key = f"pipeline:{pipeline_id}"
         state = {
             "status": "running",
-            "iteration": 0,
-            "current_step_index": 0,
             "models": models,
-            "total_iterations": iterations,
-            "results": [],
+            "total_simulations": simulations,
+            "completed_simulations": 0,
         }
-        await r.set(f"pipeline:{pipeline_id}", json.dumps(state))
-
-        # Main loop: iterate N times
-        for i in range(iterations):
-            iteration_results = {}
-            previous_result = None
-
-            # For each iteration, run all models sequentially
-            for step_index, model in enumerate(models):
-                job_id = str(uuid.uuid4())
-                
-                # Update state to show current progress
-                state["iteration"] = i + 1
-                state["current_step_index"] = step_index
-                state["current_model"] = model
-                await r.set(f"pipeline:{pipeline_id}", json.dumps(state))
-
-                # Build job data
-                job_data = {
-                    "job_id": job_id,
-                    "iteration": i + 1,
-                    "step": step_index,
-                    "model": model,
-                }
-                
-                # If there's a previous result, pass it as input
-                if previous_result is not None:
-                    job_data["input"] = previous_result
-
-                # Publish job
-                await publish_job(channel, model, job_data)
-                
-                # Get timeout for this worker (default to 120s if not specified)
-                timeout = WORKER_TIMEOUTS.get(model, 120.0)
-                
-                # Wait for result
-                result = await wait_for_result(r, job_id, timeout=timeout)
-                iteration_results[model] = result
-                previous_result = result
-                
-                logger.info(
-                    f"Pipeline {pipeline_id}: Iteration {i+1}/{iterations}, "
-                    f"Model {model} (step {step_index+1}/{len(models)}) completed"
-                )
-
-            # Store complete iteration results
-            state["results"].append(
-                {"iteration": i + 1, "models": iteration_results}
-            )
-            await r.set(f"pipeline:{pipeline_id}", json.dumps(state))
-
-        # Mark as completed
-        state["status"] = "completed"
-        state["current_step_index"] = None
-        state["current_model"] = None
-        await r.set(f"pipeline:{pipeline_id}", json.dumps(state))
+        await r.set(state_key, json.dumps(state))
+        
+        # Create tasks for all simulations to run concurrently
+        # Each simulation flows through the model pipeline independently
         logger.info(
-            f"Pipeline {pipeline_id} completed: {iterations} iterations across "
-            f"{len(models)} models"
+            f"Starting pipeline {pipeline_id} with {simulations} simulations "
+            f"across {len(models)} models: {models}"
         )
+        
+        tasks = [
+            run_simulation_pipeline(pipeline_id, sim_id, models, r, channel, state_key)
+            for sim_id in range(1, simulations + 1)
+        ]
+        
+        # Run all simulations concurrently
+        await asyncio.gather(*tasks)
+        
+        # Update state to completed
+        state["status"] = "completed"
+        await r.set(state_key, json.dumps(state))
+        logger.info(f"Pipeline {pipeline_id} completed: {simulations} simulations")
 
     except Exception as e:
         logger.error(f"Error in pipeline {pipeline_id}: {e}", exc_info=True)
         if r:
-            state["status"] = "error"
-            state["error"] = str(e)
+            state = {
+                "status": "error",
+                "error": str(e),
+                "models": models,
+                "total_simulations": simulations,
+            }
             await r.set(f"pipeline:{pipeline_id}", json.dumps(state))
     finally:
         if r:
@@ -184,30 +222,34 @@ async def create_pipeline(
     request: PipelineRequest, background_tasks: BackgroundTasks
 ):
     """
-    Create and start a new pipeline.
+    Create and start a new pipeline with concurrent simulations.
+    
+    Each simulation flows through the models sequentially (A -> B -> C -> ...).
+    All simulations run concurrently - as soon as one finishes a model step,
+    it immediately starts the next model in the pipeline.
     
     Args:
-        request: PipelineRequest with models (list of strings) and iterations (int)
+        request: PipelineRequest with models (list of strings) and simulations (int)
     
     Example:
         POST /pipeline
         {
             "models": ["worker_a", "worker_b"],
-            "iterations": 10
+            "simulations": 10
         }
     
-    Returns:
+    Response:
         {"pipeline_id": "..."}
     """
     # Validate input
     if not request.models:
         return {"error": "models list cannot be empty"}
-    if request.iterations < 1:
-        return {"error": "iterations must be at least 1"}
+    if request.simulations < 1:
+        return {"error": "simulations must be at least 1"}
 
     pipeline_id = str(uuid.uuid4())
     background_tasks.add_task(
-        run_pipeline, pipeline_id, request.models, request.iterations
+        run_pipeline, pipeline_id, request.models, request.simulations
     )
     return {"pipeline_id": pipeline_id}
 
@@ -217,32 +259,55 @@ async def get_pipeline(pipeline_id: str):
     """
     Get the current status of a pipeline.
     
-    Example response:
+    Example response (running):
         {
             "status": "running",
-            "iteration": 3,
-            "current_step_index": 0,
-            "current_model": "worker_a",
             "models": ["worker_a", "worker_b"],
-            "total_iterations": 10,
-            "results": [
-                {
-                    "iteration": 1,
-                    "models": {
-                        "worker_a": {"status": "completed", "cpu_seconds": 1.005},
-                        "worker_b": {"status": "completed", "cpu_seconds": 25.012}
-                    }
+            "total_simulations": 10,
+            "completed_simulations": 5,
+            "results": {
+                "simulation_1": {
+                    "worker_a": {"status": "completed", "cpu_seconds": 1.005},
+                    "worker_b": {"status": "completed", "cpu_seconds": 25.012}
                 },
-                ...
-            ]
+                "simulation_2": {...}
+            }
+        }
+    
+    Example response (completed):
+        {
+            "status": "completed",
+            "models": ["worker_a", "worker_b"],
+            "total_simulations": 10,
+            "completed_simulations": 10,
+            "results": {...all simulations...}
         }
     """
     r = await get_redis()
-    data = await r.get(f"pipeline:{pipeline_id}")
-    await r.aclose()
-    if not data:
-        return {"error": "not found"}
-    return json.loads(data)
+    try:
+        state_key = f"pipeline:{pipeline_id}"
+        state_data = await r.get(state_key)
+        
+        if not state_data:
+            await r.aclose()
+            return {"error": "not found"}
+        
+        state = json.loads(state_data)
+        
+        # Fetch results hash
+        results_hash = await r.hgetall(f"{state_key}:results")
+        results = {}
+        for sim_id, sim_result in results_hash.items():
+            results[sim_id] = json.loads(sim_result)
+        
+        state["results"] = results
+        
+        # Count completed simulations
+        state["completed_simulations"] = len(results)
+        
+        return state
+    finally:
+        await r.aclose()
 
 
 @app.get("/health")
