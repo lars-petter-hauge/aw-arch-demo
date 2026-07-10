@@ -1,0 +1,17 @@
+# Override for Codespaces - exposes services with ports
+# Automatically used when running in devcontainer
+version: '3.8'
+
+services:
+  rabbitmq:
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  api:
+    ports:
+      - "8000:8000"
