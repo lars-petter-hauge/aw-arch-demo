@@ -1,1 +1,67 @@
-# aw-arch-demo
+# AW Architecture Demo
+
+Proof-of-concept demonstrating how to decouple a web API from compute-heavy model workers using an async job queue.
+
+## Problem
+
+In the current setup, the backend both serves the API and runs compute models directly. When a heavy model runs, the API becomes unresponsive. Additionally, different models have different dependencies and may be written in different languages — cramming them into one container is impractical.
+
+## Architecture
+
+```
+┌──────────┐       ┌───────┐       ┌───────┐
+│  Client  │──────▶│  API  │──────▶│ Redis │
+└──────────┘       └───────┘       └───┬───┘
+                                       │
+                             ┌─────────┼─────────┐
+                             ▼                   ▼
+                       ┌──────────┐        ┌──────────┐
+                       │ Worker A │        │ Worker B │
+                       │  (~1s)   │        │ (~20-30s)│
+                       └──────────┘        └──────────┘
+```
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| **API** | FastAPI server. Exposes endpoints to trigger runs and check status. Does not run any models itself. |
+| **Redis** | Message broker and result store. Jobs are enqueued via LPUSH/BRPOP. Results stored as `result:{job_id}`. |
+| **Worker A** | Lightweight model. Consumes jobs from `queue:worker_a`. Burns ~1 second of CPU (single core, 100%). |
+| **Worker B** | Heavy model. Consumes jobs from `queue:worker_b`. Burns ~20-30 seconds of CPU (single core, 100%). |
+
+### Workflow
+
+The API exposes an endpoint that triggers a **pipeline of 10 sequential runs**:
+
+For each of the 10 iterations:
+1. **Model A** runs first (~1s CPU)
+2. Once Model A completes, **Model B** runs (~20-30s CPU)
+
+So the full sequence is: A → B → A → B → ... (10 pairs).
+
+The API remains responsive throughout — all compute is offloaded to workers via Redis.
+
+### Endpoints
+
+```
+POST /pipeline
+```
+
+Returns a pipeline ID. The client can poll for status:
+
+```
+GET /pipeline/{pipeline_id}
+```
+
+Returns the current state: which iteration we're on, whether each step is pending/running/completed, and final results.
+
+## Running locally
+
+```bash
+docker-compose up --build
+```
+
+## Deployment
+
+Deployed to Radix with each component as a separate container, independently scalable. See `radixconfig.yaml`.
