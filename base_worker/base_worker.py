@@ -8,7 +8,6 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
 import aio_pika
-import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +21,6 @@ class WorkerConfig:
         queue_name: str,
         target_duration: float,
         broker_url: Optional[str] = None,
-        result_cache_url: Optional[str] = None,
     ):
         self.worker_name = worker_name
         self.queue_name = queue_name
@@ -30,16 +28,16 @@ class WorkerConfig:
         self.broker_url = broker_url or os.getenv(
             "BROKER_URL", "amqp://guest:guest@rabbitmq:5672/"
         )
-        self.result_cache_url = result_cache_url or os.getenv(
-            "RESULT_CACHE_URL", "redis://redis:6379"
-        )
 
 
 class BaseWorker(ABC):
     """Abstract base class for AMQP workers.
 
     Subclasses must implement do_work() to define worker-specific computation.
-    All common logic (AMQP connection, message processing, Redis caching) is here.
+    All common logic (AMQP connection, message processing) is handled here.
+    
+    Note: Result storage is handled by the API, not the worker.
+    Workers only need to process jobs and return results in the message ack/nack.
     """
 
     def __init__(self, config: WorkerConfig):
@@ -52,7 +50,6 @@ class BaseWorker(ABC):
         self.logger = logging.getLogger(f"worker.{config.worker_name}")
         self.connection: Optional[aio_pika.RobustConnection] = None
         self.channel: Optional[aio_pika.Channel] = None
-        self.cache: Optional[aioredis.Redis] = None
 
     @staticmethod
     def cpu_burn(duration: float) -> float:
@@ -86,7 +83,7 @@ class BaseWorker(ABC):
             job: Job data from message.
 
         Returns:
-            Result dictionary to cache.
+            Result dictionary to return in message response.
         """
         pass
 
@@ -113,8 +110,6 @@ class BaseWorker(ABC):
                 # Perform work
                 result = await self.do_work(job)
 
-                # Cache result
-                await self.cache.set(f"result:{job_id}", json.dumps(result))
                 self.logger.info(
                     f"Completed job {job_id} in {result.get('cpu_seconds', 0):.2f}s"
                 )
@@ -141,18 +136,10 @@ class BaseWorker(ABC):
 
         self.logger.info(f"Queue '{self.config.queue_name}' ready")
 
-    async def setup_cache(self) -> None:
-        """Setup Redis cache connection."""
-        self.cache = await aioredis.from_url(
-            self.config.result_cache_url, decode_responses=True
-        )
-        self.logger.info(f"Cache connected to {self.config.result_cache_url}")
-
     async def run(self) -> None:
         """Main worker loop - connect and process messages."""
         try:
             await self.setup_amqp()
-            await self.setup_cache()
 
             self.logger.info(
                 f"Worker '{self.config.worker_name}' listening on "
@@ -168,8 +155,6 @@ class BaseWorker(ABC):
         except Exception as e:
             self.logger.error(f"Worker error: {e}", exc_info=True)
         finally:
-            if self.cache:
-                await self.cache.aclose()
             if self.connection:
                 await self.connection.close()
             self.logger.info("Worker shutdown complete")
