@@ -1,0 +1,68 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# KEDA ScaledObject for Worker A
+# Scales based on RabbitMQ queue depth: jobs.worker_a
+# Min replicas: 1, Max replicas: 5
+# Scale trigger: 10 messages in queue
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-a-scaler
+spec:
+  scaleTargetRef:
+    name: worker-a
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  triggers:
+  - type: rabbitmq
+    metadata:
+      host: "amqp://guest:guest@rabbitmq:5672/"
+      queueName: jobs.worker_a
+      mode: QueueLength
+      value: "10"  # Scale up if queue depth exceeds 10
+---
+# ═════════════════════════════════════════════════════════════════════════════
+# KEDA ScaledObject for Worker B
+# Scales based on RabbitMQ queue depth: jobs.worker_b
+# Min replicas: 1, Max replicas: 5
+# Scale trigger: 10 messages in queue
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-b-scaler
+spec:
+  scaleTargetRef:
+    name: worker-b
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  triggers:
+  - type: rabbitmq
+    metadata:
+      host: "amqp://guest:guest@rabbitmq:5672/"
+      queueName: jobs.worker_b
+      mode: QueueLength
+      value: "10"  # Scale up if queue depth exceeds 10
+---
+# ═════════════════════════════════════════════════════════════════════════════
+# KEDA ScaledObject for Worker C
+# Scales based on RabbitMQ queue depth: jobs.worker_c
+# Min replicas: 1, Max replicas: 5
+# Scale trigger: 10 messages in queue
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-c-scaler
+spec:
+  scaleTargetRef:
+    name: worker-c
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  triggers:
+  - type: rabbitmq
+    metadata:
+      host: "amqp://guest:guest@rabbitmq:5672/"
+      queueName: jobs.worker_c
+      mode: QueueLength
+      value: "10"  # Scale up if queue depth exceeds 10
