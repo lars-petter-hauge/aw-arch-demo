@@ -202,11 +202,13 @@ docker-compose up --build
 
 ```
 rabbitmq_1  | Starting RabbitMQ 3.12.11 on Erlang 25.3.2.4
-redis_1     | Ready to accept connections
 api_1       | INFO:     Uvicorn running on http://0.0.0.0:8000
+dashboard_1 | You can now view your Streamlit app in your browser.
 worker_a_1  | INFO:root:Worker A listening on jobs.worker_a
 worker_b_1  | INFO:root:Worker B listening on jobs.worker_b
 ```
+
+Dashboard URL: `http://localhost:8501`
 
 ### Using the API
 
@@ -275,6 +277,17 @@ You'll see:
 - **Messages:** Real-time message flow from API → queue → worker → ack
 
 Watch as models are dynamically added based on your request!
+
+### Monitoring Dashboard (Mobile Friendly)
+
+Open `http://localhost:8501` in your browser (or phone on the same network).
+
+The dashboard includes:
+- **Quick Launch buttons** for one-tap pipeline starts
+- **Advanced Configuration** to choose workers and number of simulations
+- **Pipeline tracking** with progress and results
+- **Queue metrics** charts and totals
+- **Compact mode** toggle in the sidebar for phone-first workflow
 
 ### Load Testing (Docker Compose)
 

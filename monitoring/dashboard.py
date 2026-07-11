@@ -26,7 +26,7 @@ st.set_page_config(
     page_title="AW Arch Demo - Monitoring",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # API URL
@@ -63,6 +63,12 @@ st.markdown(
     }
     
     /* Dashboard styling */
+    .block-container {
+        max-width: 1100px;
+        padding-top: 1rem;
+        padding-bottom: 2rem;
+    }
+
     .stMetric {
         background-color: #f0f2f6;
         padding: 1rem;
@@ -137,6 +143,15 @@ def get_pipeline_status(pipeline_id: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to fetch pipeline status: {e}")
     return None
+
+
+def submit_pipeline(models, simulations: int) -> str:
+    """Submit a pipeline and return pipeline ID on success."""
+    payload = {"models": models, "simulations": int(simulations)}
+    response = requests.post(f"{API_URL}/pipeline", json=payload, timeout=10)
+    if response.status_code == 200:
+        return response.json().get("pipeline_id", "")
+    raise RuntimeError(f"Failed to submit pipeline: HTTP {response.status_code}")
 
 
 def render_header():
@@ -232,9 +247,64 @@ def render_queue_metrics():
         st.warning("⚠️ Unable to fetch metrics from API")
 
 
+def render_compact_queue_metrics(metrics: Dict[str, Any]):
+    """Render condensed queue metrics for compact mode."""
+    st.subheader("📬 Queue Snapshot")
+    if not metrics or "queues" not in metrics:
+        st.warning("⚠️ Unable to fetch metrics from API")
+        return
+
+    queues = metrics.get("queues", {})
+    total_jobs = metrics.get("total_jobs_waiting", 0)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total Jobs", total_jobs)
+    with col2:
+        st.metric("Active Queues", len([d for d in queues.values() if d > 0]))
+
+    if queues:
+        queue_rows = [
+            {"Queue": q.replace("jobs.", "").upper(), "Waiting": d}
+            for q, d in queues.items()
+        ]
+        st.dataframe(queue_rows, use_container_width=True, hide_index=True)
+
+
 def render_pipeline_section():
     """Render pipeline submission and tracking - Mobile optimized."""
     st.subheader("🚀 Submit Pipeline")
+
+    st.caption("Use quick launch for one-tap runs, or configure workers and simulations manually.")
+
+    quick_col1, quick_col2, quick_col3 = st.columns(3)
+    with quick_col1:
+        run_quick_1 = st.button("1 Sim A->B", use_container_width=True)
+    with quick_col2:
+        run_quick_2 = st.button("10 Sims A->B", use_container_width=True)
+    with quick_col3:
+        run_quick_3 = st.button("25 Sims A->B->C", use_container_width=True)
+
+    quick_request = None
+    if run_quick_1:
+        quick_request = (["worker_a", "worker_b"], 1)
+    elif run_quick_2:
+        quick_request = (["worker_a", "worker_b"], 10)
+    elif run_quick_3:
+        quick_request = (["worker_a", "worker_b", "worker_c"], 25)
+
+    if quick_request:
+        try:
+            models, simulations = quick_request
+            pipeline_id = submit_pipeline(models=models, simulations=simulations)
+            if pipeline_id:
+                st.success("✅ Quick pipeline submitted")
+                st.info(f"**Pipeline ID:** `{pipeline_id}`")
+                st.session_state.last_pipeline_id = pipeline_id
+        except Exception as e:
+            st.error(f"Error submitting quick pipeline: {e}")
+
+    st.markdown("#### Advanced Configuration")
 
     # Mobile-friendly form layout
     with st.form("pipeline_form"):
@@ -242,14 +312,16 @@ def render_pipeline_section():
             "Select Models",
             ["worker_a", "worker_b", "worker_c"],
             default=["worker_a", "worker_b"],
+            help="Tap one or more workers to build the execution pipeline order.",
         )
 
-        simulations = st.number_input(
+        simulations = st.slider(
             "Number of Simulations",
             min_value=1,
-            max_value=1000,
+            max_value=200,
             value=10,
             step=1,
+            help="How many independent simulations to run through the selected workers.",
         )
         
         submit_button = st.form_submit_button("▶️ Submit Pipeline", use_container_width=True)
@@ -259,19 +331,12 @@ def render_pipeline_section():
                 st.error("Please select at least one model")
             else:
                 try:
-                    payload = {"models": models, "simulations": simulations}
-                    response = requests.post(
-                        f"{API_URL}/pipeline", json=payload, timeout=10
-                    )
-                    if response.status_code == 200:
-                        result = response.json()
-                        pipeline_id = result.get("pipeline_id")
+                    pipeline_id = submit_pipeline(models=models, simulations=simulations)
+                    if pipeline_id:
                         st.success(f"✅ Pipeline submitted!")
                         st.info(f"**Pipeline ID:** `{pipeline_id}`")
                         # Store in session state for easy access
                         st.session_state.last_pipeline_id = pipeline_id
-                    else:
-                        st.error(f"Failed to submit pipeline: {response.status_code}")
                 except Exception as e:
                     st.error(f"Error submitting pipeline: {e}")
 
@@ -353,6 +418,40 @@ def render_pipeline_section():
             st.warning("⚠️ Pipeline not found or has an error")
 
 
+def render_pipeline_track_only_section():
+    """Render only pipeline tracking controls for compact mode."""
+    st.subheader("📋 Track Pipeline")
+    default_id = st.session_state.get("last_pipeline_id", "")
+
+    pipeline_id = st.text_input(
+        "Pipeline ID",
+        value=default_id,
+        placeholder="Paste pipeline ID",
+        label_visibility="visible",
+    )
+
+    if pipeline_id:
+        status = get_pipeline_status(pipeline_id)
+        if status and status.get("status") != "error":
+            completed = status.get("completed_simulations", 0)
+            total = status.get("total_simulations", 1)
+            progress = (completed / total * 100) if total > 0 else 0
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Status", status.get("status", "unknown").upper())
+            with c2:
+                st.metric("Done", completed)
+            with c3:
+                st.metric("Progress", f"{progress:.1f}%")
+
+            if total > 0:
+                st.progress(completed / total)
+                st.caption(f"{completed}/{total} simulations completed")
+        else:
+            st.warning("⚠️ Pipeline not found or has an error")
+
+
 def render_info_section():
     """Render information section - Mobile friendly."""
     st.divider()
@@ -400,11 +499,33 @@ def main():
     # Initialize session state
     if "last_pipeline_id" not in st.session_state:
         st.session_state.last_pipeline_id = ""
+
+    if "compact_mode" not in st.session_state:
+        st.session_state.compact_mode = False
+
+    with st.sidebar:
+        st.markdown("### Display")
+        st.session_state.compact_mode = st.toggle(
+            "Compact mode",
+            value=st.session_state.compact_mode,
+            help="Prioritize launch + tracking controls and reduce heavy visuals for phone screens.",
+        )
     
     render_header()
-    render_queue_metrics()
-    render_pipeline_section()
-    render_info_section()
+
+    if st.session_state.compact_mode:
+        metrics = get_metrics()
+        render_pipeline_section()
+        render_pipeline_track_only_section()
+        st.divider()
+        render_compact_queue_metrics(metrics)
+        with st.expander("ℹ️ Links", expanded=False):
+            st.code(API_URL, language="text")
+            st.code("http://localhost:15672", language="text")
+    else:
+        render_queue_metrics()
+        render_pipeline_section()
+        render_info_section()
 
     # Footer
     st.markdown("---")
