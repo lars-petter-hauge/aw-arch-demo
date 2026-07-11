@@ -59,11 +59,9 @@ class MetricsCollector:
             if not self.channel:
                 await self.connect()
 
-            queue = await self.channel.get_queue(queue_name, ensure=False)
-            if queue:
-                message_count = queue.declaration_result.method.message_count
-                return message_count
-            return 0
+            # Passive declare reads queue metadata without creating/changing queue.
+            declaration = await self.channel.declare_queue(queue_name, passive=True)
+            return declaration.declaration_result.message_count
         except Exception as e:
             logger.warning(f"Could not get queue depth for {queue_name}: {e}")
             return 0

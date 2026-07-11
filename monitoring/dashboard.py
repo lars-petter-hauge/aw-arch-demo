@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import pandas as pd
+from streamlit_autorefresh import st_autorefresh
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +32,7 @@ st.set_page_config(
 
 # API URL
 API_URL = os.getenv("API_URL", "http://localhost:8000")
+POLL_INTERVAL_MS = 500
 
 # Custom CSS for mobile responsiveness
 st.markdown(
@@ -175,11 +177,31 @@ def render_header():
 def render_queue_metrics():
     """Render queue depth metrics - Mobile optimized."""
     st.subheader("📬 Message Queues")
+    st.caption("Shows both waiting jobs and in-progress jobs currently being processed by workers.")
+
+    tracked_pipeline_id = st.session_state.get(
+        "tracked_pipeline_id", st.session_state.get("last_pipeline_id", "")
+    )
+    if tracked_pipeline_id:
+        tracked_status = get_pipeline_status(tracked_pipeline_id)
+        if tracked_status and tracked_status.get("status") != "error":
+            total_simulations = tracked_status.get("total_simulations", 0)
+            completed_simulations = tracked_status.get("completed_simulations", 0)
+            in_progress_simulations = max(total_simulations - completed_simulations, 0)
+
+            a_col, b_col, c_col = st.columns(3)
+            with a_col:
+                st.metric("Tracked Pipeline", tracked_pipeline_id[:8])
+            with b_col:
+                st.metric("In Progress", in_progress_simulations)
+            with c_col:
+                st.metric("Completed", completed_simulations)
 
     metrics = get_metrics()
 
     if metrics and "queues" in metrics:
         queues = metrics["queues"]
+        queue_stats = metrics.get("queue_stats", {})
 
         # Mobile-friendly queue cards (stacked on mobile)
         col1, col2, col3 = st.columns(3)
@@ -217,8 +239,17 @@ def render_queue_metrics():
                 )
 
         # Total jobs
-        total_jobs = metrics.get("total_jobs_waiting", 0)
-        st.metric("Total Jobs Waiting", f"{total_jobs}", label_visibility="visible")
+        total_waiting = metrics.get("total_jobs_waiting", 0)
+        total_processing = metrics.get("total_jobs_processing", 0)
+        total_in_system = metrics.get("total_jobs_in_system", total_waiting + total_processing)
+
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            st.metric("Total Waiting", f"{total_waiting}", label_visibility="visible")
+        with t2:
+            st.metric("Total Processing", f"{total_processing}", label_visibility="visible")
+        with t3:
+            st.metric("Total In System", f"{total_in_system}", label_visibility="visible")
 
         # Chart - Responsive
         if queues:
@@ -233,7 +264,7 @@ def render_queue_metrics():
                 chart_data,
                 x="Queue",
                 y="Jobs Waiting",
-                title="Queue Depth by Worker",
+                title="Waiting Queue Depth by Worker",
                 color="Queue",
                 text="Jobs Waiting",
             )
@@ -243,27 +274,76 @@ def render_queue_metrics():
                 hovermode="x unified"
             )
             st.plotly_chart(fig, use_container_width=True)
+
+        if queue_stats:
+            per_queue_rows = []
+            for queue_name, stats in queue_stats.items():
+                per_queue_rows.append(
+                    {
+                        "Queue": queue_name.replace("jobs.", "").upper(),
+                        "Waiting": stats.get("ready", 0),
+                        "Processing": stats.get("unacked", 0),
+                        "Total": stats.get("total", 0),
+                        "Consumers": stats.get("consumers", 0),
+                    }
+                )
+            st.markdown("#### Per-Queue Runtime Stats")
+            st.dataframe(per_queue_rows, use_container_width=True, hide_index=True)
     else:
         st.warning("⚠️ Unable to fetch metrics from API")
 
 
-def render_compact_queue_metrics(metrics: Dict[str, Any]):
+def render_compact_queue_metrics(
+    metrics: Dict[str, Any], tracked_pipeline_id: str = "", tracked_status: Dict[str, Any] = None
+):
     """Render condensed queue metrics for compact mode."""
     st.subheader("📬 Queue Snapshot")
+    st.caption("Waiting and processing jobs across all worker queues.")
+
+    if tracked_pipeline_id and tracked_status and tracked_status.get("status") != "error":
+        total_simulations = tracked_status.get("total_simulations", 0)
+        completed_simulations = tracked_status.get("completed_simulations", 0)
+        in_progress_simulations = max(total_simulations - completed_simulations, 0)
+
+        p_col1, p_col2 = st.columns(2)
+        with p_col1:
+            st.metric("In Progress", in_progress_simulations)
+        with p_col2:
+            st.metric("Completed", completed_simulations)
+
     if not metrics or "queues" not in metrics:
         st.warning("⚠️ Unable to fetch metrics from API")
         return
 
     queues = metrics.get("queues", {})
-    total_jobs = metrics.get("total_jobs_waiting", 0)
+    total_waiting = metrics.get("total_jobs_waiting", 0)
+    total_processing = metrics.get("total_jobs_processing", 0)
+    total_in_system = metrics.get("total_jobs_in_system", total_waiting + total_processing)
+    queue_stats = metrics.get("queue_stats", {})
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Total Jobs", total_jobs)
+        st.metric("Waiting", total_waiting)
     with col2:
+        st.metric("Processing", total_processing)
+    with col3:
+        st.metric("In System", total_in_system)
+
+    col4, _ = st.columns(2)
+    with col4:
         st.metric("Active Queues", len([d for d in queues.values() if d > 0]))
 
-    if queues:
+    if queue_stats:
+        queue_rows = [
+            {
+                "Queue": q.replace("jobs.", "").upper(),
+                "Waiting": stats.get("ready", 0),
+                "Processing": stats.get("unacked", 0),
+            }
+            for q, stats in queue_stats.items()
+        ]
+        st.dataframe(queue_rows, use_container_width=True, hide_index=True)
+    elif queues:
         queue_rows = [
             {"Queue": q.replace("jobs.", "").upper(), "Waiting": d}
             for q, d in queues.items()
@@ -271,7 +351,7 @@ def render_compact_queue_metrics(metrics: Dict[str, Any]):
         st.dataframe(queue_rows, use_container_width=True, hide_index=True)
 
 
-def render_pipeline_section():
+def render_pipeline_section(show_tracking: bool = True):
     """Render pipeline submission and tracking - Mobile optimized."""
     st.subheader("🚀 Submit Pipeline")
 
@@ -301,6 +381,7 @@ def render_pipeline_section():
                 st.success("✅ Quick pipeline submitted")
                 st.info(f"**Pipeline ID:** `{pipeline_id}`")
                 st.session_state.last_pipeline_id = pipeline_id
+                st.session_state.tracked_pipeline_id = pipeline_id
         except Exception as e:
             st.error(f"Error submitting quick pipeline: {e}")
 
@@ -337,99 +418,108 @@ def render_pipeline_section():
                         st.info(f"**Pipeline ID:** `{pipeline_id}`")
                         # Store in session state for easy access
                         st.session_state.last_pipeline_id = pipeline_id
+                        st.session_state.tracked_pipeline_id = pipeline_id
                 except Exception as e:
                     st.error(f"Error submitting pipeline: {e}")
 
-    st.divider()
+    if show_tracking:
+        st.divider()
 
-    st.subheader("📋 Track Pipeline")
-    
-    # Use last pipeline ID if available
-    default_id = st.session_state.get("last_pipeline_id", "")
-    
-    pipeline_id = st.text_input(
-        "Enter Pipeline ID",
-        value=default_id,
-        placeholder="Enter pipeline ID to track progress"
-    )
+        st.subheader("📋 Track Pipeline")
 
-    if pipeline_id:
-        status = get_pipeline_status(pipeline_id)
-        if status and status.get("status") != "error":
-            # Status cards - Mobile responsive
-            st.markdown("### Status Overview")
-            
-            col1, col2, col3 = st.columns(3)
+        default_id = st.session_state.get(
+            "tracked_pipeline_id", st.session_state.get("last_pipeline_id", "")
+        )
 
-            with col1:
-                status_text = status.get("status", "Unknown").upper()
-                status_class = f"status-{status.get('status', 'unknown').lower()}"
-                st.metric("Status", status_text)
+        pipeline_id = st.text_input(
+            "Enter Pipeline ID",
+            value=default_id,
+            key="pipeline_id_input_full",
+            placeholder="Enter pipeline ID to track progress",
+        )
+        st.session_state.tracked_pipeline_id = pipeline_id
 
-            with col2:
-                st.metric(
-                    "Total Simulations",
-                    status.get("total_simulations", 0),
-                )
+        if pipeline_id:
+            status = get_pipeline_status(pipeline_id)
+            if status and status.get("status") != "error":
+                # Status cards - Mobile responsive
+                st.markdown("### Status Overview")
 
-            with col3:
                 completed = status.get("completed_simulations", 0)
                 total = status.get("total_simulations", 1)
                 progress = (completed / total * 100) if total > 0 else 0
-                st.metric("Progress", f"{progress:.1f}%")
 
-            # Progress bar
-            st.markdown("### Progress")
-            completed = status.get("completed_simulations", 0)
-            total = status.get("total_simulations", 1)
-            if total > 0:
-                st.progress(completed / total)
-                st.caption(f"{completed}/{total} simulations completed")
+                col1, col2, col3, col4 = st.columns(4)
 
-            # Models
-            if "models" in status:
-                st.markdown("### Configuration")
-                st.write(f"**Models:** {', '.join(status['models'])}")
-
-            # Results (if any)
-            if "results" in status and status["results"]:
-                st.markdown("### Results")
-                results = status["results"]
-                
-                # Show summary
-                col1, col2 = st.columns(2)
                 with col1:
-                    st.metric("Results Available", len(results))
-                
-                # Expandable results section
-                with st.expander(f"📊 View {len(results)} simulation results"):
-                    # Limit display on mobile
-                    display_count = min(5, len(results))
-                    st.caption(f"Showing first {display_count} of {len(results)} results")
-                    
-                    for sim_key, sim_result in list(results.items())[:display_count]:
-                        with st.expander(f"ℹ️ {sim_key}", expanded=False):
+                    status_text = status.get("status", "Unknown").upper()
+                    st.metric("Status", status_text)
+
+                with col2:
+                    st.metric(
+                        "Total Simulations",
+                        total,
+                    )
+
+                with col3:
+                    st.metric("Completed", completed)
+
+                with col4:
+                    st.metric("Progress", f"{progress:.1f}%")
+
+                # Progress bar
+                st.markdown("### Progress")
+                if total > 0:
+                    st.progress(completed / total)
+                    st.caption(f"{completed}/{total} simulations completed")
+
+                # Models
+                if "models" in status:
+                    st.markdown("### Configuration")
+                    st.write(f"**Models:** {', '.join(status['models'])}")
+
+                # Results (if any)
+                if "results" in status and status["results"]:
+                    st.markdown("### Results")
+                    results = status["results"]
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Results Available", len(results))
+
+                    with st.expander(f"📊 View {len(results)} simulation results"):
+                        display_count = min(5, len(results))
+                        st.caption(f"Showing first {display_count} of {len(results)} results")
+
+                        for sim_key, sim_result in list(results.items())[:display_count]:
+                            st.markdown(f"**{sim_key}**")
                             if isinstance(sim_result, dict):
                                 st.json(sim_result)
                             else:
                                 st.write(sim_result)
+                            st.divider()
 
-        else:
-            st.warning("⚠️ Pipeline not found or has an error")
+            else:
+                st.warning("⚠️ Pipeline not found or has an error")
 
 
 def render_pipeline_track_only_section():
     """Render only pipeline tracking controls for compact mode."""
     st.subheader("📋 Track Pipeline")
-    default_id = st.session_state.get("last_pipeline_id", "")
+    default_id = st.session_state.get(
+        "tracked_pipeline_id", st.session_state.get("last_pipeline_id", "")
+    )
 
     pipeline_id = st.text_input(
         "Pipeline ID",
         value=default_id,
+        key="pipeline_id_input_compact",
         placeholder="Paste pipeline ID",
         label_visibility="visible",
     )
+    st.session_state.tracked_pipeline_id = pipeline_id
 
+    status = None
     if pipeline_id:
         status = get_pipeline_status(pipeline_id)
         if status and status.get("status") != "error":
@@ -450,6 +540,8 @@ def render_pipeline_track_only_section():
                 st.caption(f"{completed}/{total} simulations completed")
         else:
             st.warning("⚠️ Pipeline not found or has an error")
+
+    return pipeline_id, status
 
 
 def render_info_section():
@@ -503,6 +595,9 @@ def main():
     if "compact_mode" not in st.session_state:
         st.session_state.compact_mode = False
 
+    if "tracked_pipeline_id" not in st.session_state:
+        st.session_state.tracked_pipeline_id = st.session_state.last_pipeline_id
+
     with st.sidebar:
         st.markdown("### Display")
         st.session_state.compact_mode = st.toggle(
@@ -510,15 +605,24 @@ def main():
             value=st.session_state.compact_mode,
             help="Prioritize launch + tracking controls and reduce heavy visuals for phone screens.",
         )
+
+        auto_refresh_enabled = st.toggle(
+            "Auto-refresh (0.5s)",
+            value=True,
+            help="Continuously poll queue and pipeline status every 0.5 seconds.",
+        )
+
+    if auto_refresh_enabled:
+        st_autorefresh(interval=POLL_INTERVAL_MS, key="dashboard_auto_refresh")
     
     render_header()
 
     if st.session_state.compact_mode:
         metrics = get_metrics()
-        render_pipeline_section()
-        render_pipeline_track_only_section()
+        render_pipeline_section(show_tracking=False)
+        tracked_pipeline_id, tracked_status = render_pipeline_track_only_section()
         st.divider()
-        render_compact_queue_metrics(metrics)
+        render_compact_queue_metrics(metrics, tracked_pipeline_id, tracked_status)
         with st.expander("ℹ️ Links", expanded=False):
             st.code(API_URL, language="text")
             st.code("http://localhost:15672", language="text")
@@ -530,15 +634,6 @@ def main():
     # Footer
     st.markdown("---")
     st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Auto-refresh every 5 seconds (optional - comment out if too aggressive)
-    # st.markdown("""
-    # <script>
-    # setTimeout(function() {
-    #     window.location.reload();
-    # }, 5000);
-    # </script>
-    # """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

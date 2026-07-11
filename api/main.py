@@ -3,6 +3,9 @@ import json
 import uuid
 import os
 import logging
+import base64
+import urllib.request
+import urllib.parse
 from typing import List, Dict, Any
 
 import aio_pika
@@ -16,6 +19,9 @@ app = FastAPI(title="AW Arch Demo API")
 
 # Configuration
 BROKER_URL = os.getenv("BROKER_URL", "amqp://guest:guest@rabbitmq:5672/")
+RABBITMQ_MGMT_URL = os.getenv("RABBITMQ_MGMT_URL", "http://rabbitmq:15672")
+RABBITMQ_MGMT_USER = os.getenv("RABBITMQ_MGMT_USER", "guest")
+RABBITMQ_MGMT_PASS = os.getenv("RABBITMQ_MGMT_PASS", "guest")
 
 # Default worker timeouts (in seconds) by model name
 WORKER_TIMEOUTS = {
@@ -371,13 +377,62 @@ async def get_queue_depth(queue_name: str) -> int:
     """
     try:
         channel = await get_amqp_channel()
-        queue = await channel.get_queue(queue_name, ensure=False)
-        if queue:
-            return queue.declaration_result.method.message_count
-        return 0
+        # Passive declare reads queue metadata without creating/changing queue.
+        declaration = await channel.declare_queue(queue_name, passive=True)
+        return declaration.declaration_result.message_count
     except Exception as e:
         logger.warning(f"Could not get queue depth for {queue_name}: {e}")
         return 0
+
+
+def _fetch_queue_stats_from_management(queue_name: str) -> Dict[str, int]:
+    """Fetch queue stats from RabbitMQ management API.
+
+    Returns a dictionary with ready and unacked message counts.
+    """
+    vhost = urllib.parse.quote("/", safe="")
+    encoded_queue_name = urllib.parse.quote(queue_name, safe="")
+    url = f"{RABBITMQ_MGMT_URL}/api/queues/{vhost}/{encoded_queue_name}"
+
+    credentials = f"{RABBITMQ_MGMT_USER}:{RABBITMQ_MGMT_PASS}".encode("utf-8")
+    auth_header = base64.b64encode(credentials).decode("utf-8")
+
+    request = urllib.request.Request(url)
+    request.add_header("Authorization", f"Basic {auth_header}")
+
+    with urllib.request.urlopen(request, timeout=2.0) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    ready = int(payload.get("messages_ready", payload.get("messages", 0)))
+    unacked = int(payload.get("messages_unacknowledged", 0))
+    consumers = int(payload.get("consumers", 0))
+
+    return {
+        "ready": ready,
+        "unacked": unacked,
+        "total": ready + unacked,
+        "consumers": consumers,
+    }
+
+
+async def get_queue_runtime_stats(queue_name: str) -> Dict[str, int]:
+    """Get queue stats including waiting and in-progress counts.
+
+    Falls back to AMQP queue depth if management API is unavailable.
+    """
+    try:
+        return await asyncio.to_thread(_fetch_queue_stats_from_management, queue_name)
+    except Exception as e:
+        logger.warning(
+            f"Could not get runtime stats from management API for {queue_name}: {e}"
+        )
+        ready = await get_queue_depth(queue_name)
+        return {
+            "ready": ready,
+            "unacked": 0,
+            "total": ready,
+            "consumers": 0,
+        }
 
 
 @app.get("/metrics")
@@ -396,22 +451,37 @@ async def get_metrics():
             "jobs.worker_b": 3,
             "jobs.worker_c": 8
         },
-        "total_jobs_waiting": 16
+        "queue_stats": {
+            "jobs.worker_a": {"ready": 5, "unacked": 2, "total": 7, "consumers": 1},
+            "jobs.worker_b": {"ready": 3, "unacked": 1, "total": 4, "consumers": 1},
+            "jobs.worker_c": {"ready": 8, "unacked": 0, "total": 8, "consumers": 1}
+        },
+        "total_jobs_waiting": 16,
+        "total_jobs_processing": 3,
+        "total_jobs_in_system": 19
     }
     """
     try:
         queues = {}
+        queue_stats = {}
         for worker in AVAILABLE_WORKERS:
             queue_name = f"jobs.{worker}"
-            depth = await get_queue_depth(queue_name)
-            queues[queue_name] = depth
+            stats = await get_queue_runtime_stats(queue_name)
+            queue_stats[queue_name] = stats
+            queues[queue_name] = stats["ready"]
         
-        total_jobs = sum(queues.values())
+        total_jobs_waiting = sum(queues.values())
+        total_jobs_processing = sum(
+            stats["unacked"] for stats in queue_stats.values()
+        )
         
         return {
             "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
             "queues": queues,
-            "total_jobs_waiting": total_jobs,
+            "queue_stats": queue_stats,
+            "total_jobs_waiting": total_jobs_waiting,
+            "total_jobs_processing": total_jobs_processing,
+            "total_jobs_in_system": total_jobs_waiting + total_jobs_processing,
         }
     except Exception as e:
         logger.error(f"Error collecting metrics: {e}")

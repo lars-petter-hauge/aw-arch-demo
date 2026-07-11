@@ -4,6 +4,7 @@ import json
 import time
 import logging
 import os
+import random
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
@@ -72,6 +73,13 @@ class BaseWorker(ABC):
                 x = x - 0.0001
         elapsed = time.perf_counter() - start
         return elapsed
+
+    def sample_duration(self) -> float:
+        """Sample a randomized runtime around target duration.
+
+        Each job runs between 70% and 130% of the configured target.
+        """
+        return self.config.target_duration * random.uniform(0.7, 1.3)
 
     @abstractmethod
     async def do_work(self, job: Dict[str, Any]) -> Dict[str, Any]:

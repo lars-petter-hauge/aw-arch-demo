@@ -7,11 +7,11 @@ logging.basicConfig(level=logging.INFO)
 
 
 class WorkerC(BaseWorker):
-    """Medium worker: ~2.5 seconds CPU burn."""
+    """Medium worker: ~5 seconds average CPU burn with runtime jitter."""
 
     async def do_work(self, job: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute CPU-intensive work for ~2.5 seconds."""
-        elapsed = self.cpu_burn(self.config.target_duration)
+        """Execute CPU-intensive work with +/-30% randomized runtime."""
+        elapsed = self.cpu_burn(self.sample_duration())
         return {
             "status": "completed",
             "worker": "C",
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     config = WorkerConfig(
         worker_name="C",
         queue_name="jobs.worker_c",
-        target_duration=2.5,
+        target_duration=5.0,
     )
     worker = WorkerC(config)
     worker.start()
