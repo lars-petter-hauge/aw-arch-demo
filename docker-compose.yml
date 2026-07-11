@@ -1,8 +1,7 @@
 services:
   rabbitmq:
-    image: rabbitmq:3.12-management-alpine
+    image: rabbitmq:4-management-alpine
     ports:
-      - "5672:5672"    # AMQP port
       - "15672:15672"  # Management UI
     environment:
       RABBITMQ_DEFAULT_USER: guest
@@ -25,7 +24,9 @@ services:
     command: uvicorn main:app --host 0.0.0.0 --port 8000
 
   worker_a:
-    build: ./worker_a
+    build:
+      context: .
+      dockerfile: worker_a/Dockerfile
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -33,7 +34,9 @@ services:
       - BROKER_URL=amqp://guest:guest@rabbitmq:5672/
 
   worker_b:
-    build: ./worker_b
+    build:
+      context: .
+      dockerfile: worker_b/Dockerfile
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -41,7 +44,9 @@ services:
       - BROKER_URL=amqp://guest:guest@rabbitmq:5672/
 
   worker_c:
-    build: ./worker_c
+    build:
+      context: .
+      dockerfile: worker_c/Dockerfile
     depends_on:
       rabbitmq:
         condition: service_healthy

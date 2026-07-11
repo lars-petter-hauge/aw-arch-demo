@@ -45,7 +45,7 @@ class PipelineRequest(BaseModel):
 async def get_amqp_connection():
     """Get or create AMQP connection."""
     global amqp_connection
-    if amqp_connection is None or amqp_connection.is_closed():
+    if amqp_connection is None or amqp_connection.is_closed:
         amqp_connection = await aio_pika.connect_robust(BROKER_URL)
     return amqp_connection
 
@@ -53,7 +53,7 @@ async def get_amqp_connection():
 async def get_amqp_channel():
     """Get or create AMQP channel."""
     global amqp_channel
-    if amqp_channel is None or amqp_channel.is_closed():
+    if amqp_channel is None or amqp_channel.is_closed:
         conn = await get_amqp_connection()
         amqp_channel = await conn.channel()
     return amqp_channel
