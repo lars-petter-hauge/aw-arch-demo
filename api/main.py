@@ -372,6 +372,13 @@ async def create_pipeline(
         return {"error": "simulations must be at least 1"}
 
     pipeline_id = str(uuid.uuid4())
+    state_key = f"pipeline:{pipeline_id}"
+    results_store[state_key] = {
+        "status": "pending",
+        "models": request.models,
+        "total_simulations": request.simulations,
+        "completed_simulations": 0,
+    }
     background_tasks.add_task(
         run_pipeline, pipeline_id, request.models, request.simulations
     )

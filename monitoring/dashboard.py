@@ -208,35 +208,31 @@ def render_queue_metrics():
         
         queue_items = list(queues.items())
         
+        def _queue_card(col, queue_name, queue_stats):
+            stats = queue_stats.get(queue_name, {})
+            ready = stats.get("ready", queues.get(queue_name, 0))
+            unacked = stats.get("unacked", 0)
+            with col:
+                st.metric(
+                    label=f"{queue_name.replace('jobs.', '').upper()} — waiting",
+                    value=ready,
+                )
+                st.metric(
+                    label=f"{queue_name.replace('jobs.', '').upper()} — in flight",
+                    value=unacked,
+                )
+
         # Queue A
         if len(queue_items) > 0:
-            with col1:
-                queue_name, depth = queue_items[0]
-                st.metric(
-                    label=queue_name.replace("jobs.", "").upper(),
-                    value=f"{depth}",
-                    label_visibility="visible"
-                )
-        
+            _queue_card(col1, queue_items[0][0], queue_stats)
+
         # Queue B
         if len(queue_items) > 1:
-            with col2:
-                queue_name, depth = queue_items[1]
-                st.metric(
-                    label=queue_name.replace("jobs.", "").upper(),
-                    value=f"{depth}",
-                    label_visibility="visible"
-                )
-        
+            _queue_card(col2, queue_items[1][0], queue_stats)
+
         # Queue C
         if len(queue_items) > 2:
-            with col3:
-                queue_name, depth = queue_items[2]
-                st.metric(
-                    label=queue_name.replace("jobs.", "").upper(),
-                    value=f"{depth}",
-                    label_visibility="visible"
-                )
+            _queue_card(col3, queue_items[2][0], queue_stats)
 
         # Total jobs
         total_waiting = metrics.get("total_jobs_waiting", 0)
@@ -251,27 +247,41 @@ def render_queue_metrics():
         with t3:
             st.metric("Total In System", f"{total_in_system}", label_visibility="visible")
 
-        # Chart - Responsive
-        if queues:
-            chart_data = pd.DataFrame(
-                {
-                    "Queue": [q.replace("jobs.", "").upper() for q in queues.keys()],
-                    "Jobs Waiting": list(queues.values()),
-                }
-            )
+        # Chart - Responsive stacked bar showing waiting + in-flight
+        if queues or queue_stats:
+            queue_names = [q.replace("jobs.", "").upper() for q in (queue_stats or queues).keys()]
+            if queue_stats:
+                ready_values = [queue_stats[q].get("ready", 0) for q in queue_stats]
+                unacked_values = [queue_stats[q].get("unacked", 0) for q in queue_stats]
+            else:
+                ready_values = list(queues.values())
+                unacked_values = [0] * len(ready_values)
 
-            fig = px.bar(
-                chart_data,
-                x="Queue",
-                y="Jobs Waiting",
-                title="Waiting Queue Depth by Worker",
-                color="Queue",
-                text="Jobs Waiting",
-            )
+            fig = go.Figure(data=[
+                go.Bar(
+                    name="Waiting (ready)",
+                    x=queue_names,
+                    y=ready_values,
+                    text=ready_values,
+                    textposition="inside",
+                    marker_color="#4C78A8",
+                ),
+                go.Bar(
+                    name="In Flight (unacked)",
+                    x=queue_names,
+                    y=unacked_values,
+                    text=unacked_values,
+                    textposition="inside",
+                    marker_color="#F58518",
+                ),
+            ])
             fig.update_layout(
+                barmode="stack",
+                title="Queue Depth by Worker (Waiting + In Flight)",
                 height=400,
                 margin=dict(l=10, r=10, t=40, b=10),
-                hovermode="x unified"
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             st.plotly_chart(fig, use_container_width=True)
 
