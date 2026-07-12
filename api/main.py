@@ -3,6 +3,7 @@ import json
 import uuid
 import os
 import logging
+import time
 import base64
 import urllib.request
 import urllib.parse
@@ -118,30 +119,77 @@ async def shutdown_event():
     logger.info("AMQP connection closed")
 
 
-async def publish_job(channel: aio_pika.Channel, model_name: str, job_data: dict):
-    """Publish a job to AMQP exchange."""
+async def publish_job(
+    channel: aio_pika.Channel,
+    model_name: str,
+    job_data: dict,
+    reply_to: str = None,
+    correlation_id: str = None,
+):
+    """Publish a job to AMQP exchange.
+    
+    Args:
+        channel: AMQP channel
+        model_name: Name of the worker model (e.g., 'worker_a')
+        job_data: Job data dictionary
+        reply_to: Reply queue name for RPC
+        correlation_id: Correlation ID for RPC matching
+    """
     queue_name = f"jobs.{model_name}"
     exchange = await get_amqp_exchange()
     message = aio_pika.Message(
         body=json.dumps(job_data).encode(),
         content_type="application/json",
+        reply_to=reply_to,
+        correlation_id=correlation_id,
     )
     await exchange.publish(message, routing_key=queue_name)
 
 
-async def wait_for_result(job_id: str, timeout: float = 120.0):
-    """Poll in-memory store for a job result."""
-    elapsed = 0.0
-    while elapsed < timeout:
-        if job_id in results_store:
-            return results_store[job_id]
-        await asyncio.sleep(0.2)
-        elapsed += 0.2
+async def wait_for_result(
+    reply_queue: aio_pika.Queue, correlation_id: str, timeout: float = 120.0
+):
+    """Wait for a result from the reply queue matching the correlation_id.
+    
+    Args:
+        reply_queue: Reply queue to listen on
+        correlation_id: Correlation ID to match
+        timeout: Maximum time to wait in seconds
+        
+    Returns:
+        Result dictionary or timeout dict
+    """
+    start_time = time.time()
+    
+    async with reply_queue.iterator() as queue_iter:
+        async for message in queue_iter:
+            async with message.process():
+                # Check if this message matches our correlation_id
+                if message.correlation_id == correlation_id:
+                    result = json.loads(message.body.decode())
+                    logger.debug(f"Received result for correlation_id {correlation_id}")
+                    return result
+                else:
+                    # Log unexpected message and continue
+                    logger.warning(
+                        f"Received message with unexpected correlation_id: "
+                        f"{message.correlation_id}, expected {correlation_id}"
+                    )
+            
+            # Check timeout
+            if time.time() - start_time > timeout:
+                return {"status": "timeout"}
+    
     return {"status": "timeout"}
 
 
 async def run_simulation_pipeline(
-    pipeline_id: str, simulation_id: int, models: List[str], channel, state_key: str
+    pipeline_id: str,
+    simulation_id: int,
+    models: List[str],
+    channel: aio_pika.Channel,
+    state_key: str,
+    reply_queue: aio_pika.Queue,
 ):
     """
     Run a single simulation through the pipeline.
@@ -149,6 +197,8 @@ async def run_simulation_pipeline(
     Multiple simulations run concurrently.
     
     As soon as model_1 completes, model_2 starts immediately (with model_1's output as input).
+    Uses RPC-style communication: each job gets a unique correlation_id and waits for
+    a result on the reply queue.
     """
     try:
         simulation_results = {}
@@ -156,6 +206,7 @@ async def run_simulation_pipeline(
 
         for step_index, model in enumerate(models):
             job_id = str(uuid.uuid4())
+            correlation_id = str(uuid.uuid4())
             
             # Build job data
             job_data = {
@@ -169,8 +220,14 @@ async def run_simulation_pipeline(
             if previous_result is not None:
                 job_data["input"] = previous_result
 
-            # Publish job to queue
-            await publish_job(channel, model, job_data)
+            # Publish job to queue with RPC metadata
+            await publish_job(
+                channel,
+                model,
+                job_data,
+                reply_to=reply_queue.name,
+                correlation_id=correlation_id,
+            )
             logger.info(
                 f"Pipeline {pipeline_id}: Published simulation {simulation_id} "
                 f"to model {model} (step {step_index + 1}/{len(models)})"
@@ -180,7 +237,7 @@ async def run_simulation_pipeline(
             timeout = WORKER_TIMEOUTS.get(model, 120.0)
             
             # Wait for THIS simulation's result for this model
-            result = await wait_for_result(job_id, timeout=timeout)
+            result = await wait_for_result(reply_queue, correlation_id, timeout=timeout)
             simulation_results[model] = result
             previous_result = result
             
@@ -221,16 +278,20 @@ async def run_pipeline(
     Multiple simulations run concurrently - as soon as sim_i finishes model_j,
     it immediately starts model_j+1, while other simulations are also processing.
     
-    This creates a pipelined parallel execution:
-    SIM 1: model_a [0-1s]      -> model_b [1-26s]
-    SIM 2:            model_a [1-2s]  -> model_b [2-27s]
-    SIM 3:                       model_a [2-3s] -> model_b [3-28s]
-    ...
-    Total time ≈ 1s (first model_a) + N×1s (all model_a) + 25s (final model_b)
+    Uses RPC-style communication where workers send results back to a reply queue,
+    enabling true asynchronous pipelining.
     """
     try:
         # Get pre-initialized channel (queues already exist)
         channel = await get_amqp_channel()
+
+        # Create a unique reply queue for this pipeline
+        # All simulations in this pipeline share the same reply queue
+        reply_queue_name = f"pipeline.reply.{pipeline_id}"
+        reply_queue = await channel.declare_queue(
+            reply_queue_name, durable=False, exclusive=False
+        )
+        logger.info(f"Created reply queue: {reply_queue_name}")
 
         # Initialize pipeline state
         state_key = f"pipeline:{pipeline_id}"
@@ -250,12 +311,18 @@ async def run_pipeline(
         )
         
         tasks = [
-            run_simulation_pipeline(pipeline_id, sim_id, models, channel, state_key)
+            run_simulation_pipeline(
+                pipeline_id, sim_id, models, channel, state_key, reply_queue
+            )
             for sim_id in range(1, simulations + 1)
         ]
         
         # Run all simulations concurrently
         await asyncio.gather(*tasks)
+        
+        # Clean up reply queue
+        await reply_queue.delete()
+        logger.info(f"Deleted reply queue: {reply_queue_name}")
         
         # Update state to completed
         state["status"] = "completed"
@@ -343,7 +410,7 @@ async def get_pipeline(pipeline_id: str):
     state_key = f"pipeline:{pipeline_id}"
     
     if state_key not in results_store:
-        return {"error": "not found"}
+        return {"status": "not_found", "error": "Pipeline not found"}
     
     state = results_store[state_key].copy()
     

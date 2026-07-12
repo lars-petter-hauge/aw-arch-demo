@@ -122,10 +122,49 @@ class BaseWorker(ABC):
                     f"Completed job {job_id} in {result.get('cpu_seconds', 0):.2f}s"
                 )
 
+                # If reply_to queue is specified, send result back to API
+                if message.reply_to:
+                    await self._send_result(result, message)
+
                 # Message is automatically acknowledged after process() context
             except Exception as e:
                 self.logger.error(f"Error processing message: {e}", exc_info=True)
                 # message.nack(requeue=True) called on exception within process()
+
+    async def _send_result(
+        self, result: Dict[str, Any], original_message: aio_pika.IncomingMessage
+    ) -> None:
+        """Send result back to API via reply_to queue.
+
+        Args:
+            result: Result dictionary from do_work()
+            original_message: Original AMQP message containing reply_to and correlation_id
+        """
+        try:
+            exchange = await self.channel.get_exchange("jobs")
+            
+            # Create reply message with correlation_id to match request
+            reply_message = aio_pika.Message(
+                body=json.dumps(result).encode(),
+                content_type="application/json",
+                correlation_id=original_message.correlation_id,
+            )
+            
+            # Publish result back to API's reply queue
+            await exchange.publish(
+                reply_message,
+                routing_key=original_message.reply_to,
+            )
+            
+            self.logger.debug(
+                f"Sent result for job {result.get('job_id')} "
+                f"to {original_message.reply_to}"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to send result for job {result.get('job_id')}: {e}",
+                exc_info=True
+            )
 
     async def setup_amqp(self) -> None:
         """Setup AMQP connection, exchange, and queue."""
