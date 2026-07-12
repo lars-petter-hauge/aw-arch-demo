@@ -8,29 +8,28 @@ Constraint: No code modifications; review only.
 
 The branch demonstrates a good direction by separating API from compute workers and using queue-based asynchronous processing.
 
-The primary architecture risk is **configuration and platform drift**:
-- Runtime code and local/k8s manifests are RabbitMQ-centric AMQP.
-- Radix config is Redis-trigger based.
-- Documentation claims RabbitMQ local and Azure Service Bus production with no code changes, but current code uses RabbitMQ-specific semantics.
+The primary architecture risk is now **runtime portability and operational split**:
+- Radix config is now Azure Service Bus trigger based with runtime broker secret wiring.
+- Runtime code and local/k8s manifests remain RabbitMQ-centric AMQP.
+- Documentation still states RabbitMQ local and Azure Service Bus production with no code changes, but current code uses RabbitMQ-specific semantics.
 
 For a simplicity-first production path on Radix with scale-to-zero, the strongest conclusion is:
 - Do not move to Redis lists as the long-term job queue merely for simplicity.
-- Choose one queue architecture and align all layers (runtime, Radix config, docs, local dev) to it.
+- Choose one queue abstraction and align runtime semantics with deployment targets.
 - Given Radix + KEDA and your stated goals, **Azure Service Bus as managed production queue/scaler source is simpler operationally than self-managed RabbitMQ**.
 
 ## Findings (Ordered by Severity)
 
-### 1) Critical - Claimed RabbitMQ to Azure Service Bus portability is not true in current implementation
+### 1) Critical - Runtime portability to Azure Service Bus is not implemented in current runtime
 
 **Evidence**
 - `README.md` claims identical code local vs prod and treats RabbitMQ + Azure Service Bus as interchangeable.
   - `README.md:16`
   - `README.md:45`
-- API declares and binds RabbitMQ exchange/queue entities and uses RabbitMQ management API:
+- API declares and binds RabbitMQ exchange/queue entities:
   - `api/main.py:87` (declare exchange)
   - `api/main.py:95` (declare queue)
   - `api/main.py:96` (bind queue to exchange)
-  - `api/main.py:455` (RabbitMQ management API path)
 - Worker base also relies on exchange/queue declare-bind:
   - `base_worker/base_worker.py:177`
   - `base_worker/base_worker.py:180`
@@ -39,7 +38,7 @@ For a simplicity-first production path on Radix with scale-to-zero, the stronges
 **Why this matters**
 Azure Service Bus (AMQP 1.0) has different entity semantics from RabbitMQ (AMQP 0-9-1). The current code depends on RabbitMQ broker features, so this is not a drop-in connection-string swap.
 
-### 2) Critical - Scale-to-zero goal is contradicted by current KEDA manifest settings
+### 2) High - Scale-to-zero is not validated in local Kubernetes manifests
 
 **Evidence**
 - All scalers define `minReplicaCount: 1`:
@@ -50,20 +49,22 @@ Azure Service Bus (AMQP 1.0) has different entity semantics from RabbitMQ (AMQP 
 **Why this matters**
 Workers never scale to zero in the tested k8s setup, so idle behavior and cost profile for scale-to-zero are not being validated.
 
-### 3) High - Radix config and runtime architecture are inconsistent (Redis vs AMQP)
+### 3) Medium - Radix deployment intent is aligned to Azure Service Bus, but local manifests remain RabbitMQ-oriented
 
 **Evidence**
-- Radix uses Redis trigger and Redis env vars:
+- Radix now uses Azure Service Bus KEDA triggers with queue-based scaling and connection from runtime env/secret:
   - `radixconfig.yaml:28`
+  - `radixconfig.yaml:32`
   - `radixconfig.yaml:42`
-  - `radixconfig.yaml:18`
-- Runtime stack uses AMQP broker URL and RabbitMQ manifests:
+  - `radixconfig.yaml:46`
+  - `radixconfig.yaml:17`
+- Runtime stack and local manifests remain RabbitMQ-oriented:
   - `api/main.py:22`
   - `docker-compose.yml:23`
   - `k8s/workers.yaml:22`
 
 **Why this matters**
-This is the largest simplicity and robustness gap. Two architectures are present simultaneously, increasing deployment ambiguity and operational errors.
+This removes the earlier Redis/AMQP drift in Radix config, but the core portability gap remains: code relies on RabbitMQ entity semantics (declare/bind/exchange), so Azure Service Bus is not yet a drop-in runtime target.
 
 ### 4) High - Per-simulation exclusive reply queue introduces avoidable complexity
 
@@ -117,11 +118,9 @@ Acceptable for PoC, but not robust for production reliability/security without h
   - `radixconfig.yaml:16`
 - k8s local exposes API as NodePort:
   - `k8s/api.yaml:37`
-- Compose also exposes dashboard publicly on host:
-  - `docker-compose.yml:29`
 
 **Why this matters**
-The intended policy (only API public) is mostly preserved for Radix config, but local environments differ and should be clearly documented as intentional.
+The intended policy (only API public) is preserved for Radix config, while local environments use broader exposure for convenience and should document that as intentional.
 
 ## Simplicity and Robustness Verdict
 
@@ -131,19 +130,20 @@ The intended policy (only API public) is mostly preserved for Radix config, but 
 - KEDA-driven autoscaling direction is appropriate for workload bursts.
 
 ### What is fragile today
-- Architectural duality (Redis-trigger Radix config vs RabbitMQ runtime code).
+- Runtime portability gap (Azure Service Bus target in Radix config vs RabbitMQ-specific runtime behavior).
 - RabbitMQ-specific implementation details conflict with “same code” claim for Azure Service Bus.
-- Scale-to-zero not actually validated in current k8s manifests.
+- Scale-to-zero is not validated in current local k8s manifests.
 
 ## Specific Conclusion on RabbitMQ vs Redis for this PoC
 
 1. RabbitMQ was a reasonable choice for the PoC to demonstrate durable queue semantics, acknowledgments, and autoscaling trigger behavior.
 2. Redis lists are simpler to start with, but weaker as a long-term durable job-queue foundation for this use case.
 3. For Radix production with simplicity + scale-to-zero as core requirements, managed queueing (Azure Service Bus) is operationally simpler than running RabbitMQ yourself.
-4. Therefore: **RabbitMQ is not a poor choice conceptually for PoC**, but **the current mixed architecture is too complex**. Simplest robust path is to standardize end-to-end on the same queue architecture across runtime, manifests, and docs.
+4. Therefore: **RabbitMQ is not a poor choice conceptually for PoC**, but the current state still needs a transport abstraction or Service Bus-specific runtime path to fulfill the “same code” production claim.
 
 ## Assumptions and Review Boundaries
 
 - This review assumes target platform is Radix with KEDA available and Azure Service Bus triggers supported.
 - This is a PoC architecture review; no code changes were made.
 - Live Radix operator behavior was not executed in this repository environment during this review.
+- The review excludes `monitoring/` entirely and excludes monitoring-specific logic in `api/main.py` and worker files.
