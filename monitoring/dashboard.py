@@ -184,7 +184,7 @@ def render_queue_metrics():
     )
     if tracked_pipeline_id:
         tracked_status = get_pipeline_status(tracked_pipeline_id)
-        if tracked_status and tracked_status.get("status") != "error":
+        if tracked_status and tracked_status.get("status") not in ("error", "not_found"):
             total_simulations = tracked_status.get("total_simulations", 0)
             completed_simulations = tracked_status.get("completed_simulations", 0)
             in_progress_simulations = max(total_simulations - completed_simulations, 0)
