@@ -25,8 +25,7 @@ echo "🛠️  Installing development tools..."
 pip install \
   pytest pytest-asyncio pytest-cov \
   black flake8 pylint mypy \
-  ipython ipdb \
-  docker docker-compose
+  ipython ipdb
 
 # Install curl and jq for testing
 echo "🛠️  Installing CLI tools..."
