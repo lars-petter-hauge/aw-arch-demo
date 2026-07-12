@@ -177,75 +177,12 @@ def render_header():
 def render_queue_metrics():
     """Render queue depth metrics - Mobile optimized."""
     st.subheader("📬 Message Queues")
-    st.caption("Shows both waiting jobs and in-progress jobs currently being processed by workers.")
-
-    tracked_pipeline_id = st.session_state.get(
-        "tracked_pipeline_id", st.session_state.get("last_pipeline_id", "")
-    )
-    if tracked_pipeline_id:
-        tracked_status = get_pipeline_status(tracked_pipeline_id)
-        if tracked_status and tracked_status.get("status") not in ("error", "not_found"):
-            total_simulations = tracked_status.get("total_simulations", 0)
-            completed_simulations = tracked_status.get("completed_simulations", 0)
-            in_progress_simulations = max(total_simulations - completed_simulations, 0)
-
-            a_col, b_col, c_col = st.columns(3)
-            with a_col:
-                st.metric("Tracked Pipeline", tracked_pipeline_id[:8])
-            with b_col:
-                st.metric("In Progress", in_progress_simulations)
-            with c_col:
-                st.metric("Completed", completed_simulations)
 
     metrics = get_metrics()
 
     if metrics and "queues" in metrics:
         queues = metrics["queues"]
         queue_stats = metrics.get("queue_stats", {})
-
-        # Mobile-friendly queue cards (stacked on mobile)
-        col1, col2, col3 = st.columns(3)
-        
-        queue_items = list(queues.items())
-        
-        def _queue_card(col, queue_name, queue_stats):
-            stats = queue_stats.get(queue_name, {})
-            ready = stats.get("ready", queues.get(queue_name, 0))
-            unacked = stats.get("unacked", 0)
-            with col:
-                st.metric(
-                    label=f"{queue_name.replace('jobs.', '').upper()} — waiting",
-                    value=ready,
-                )
-                st.metric(
-                    label=f"{queue_name.replace('jobs.', '').upper()} — in flight",
-                    value=unacked,
-                )
-
-        # Queue A
-        if len(queue_items) > 0:
-            _queue_card(col1, queue_items[0][0], queue_stats)
-
-        # Queue B
-        if len(queue_items) > 1:
-            _queue_card(col2, queue_items[1][0], queue_stats)
-
-        # Queue C
-        if len(queue_items) > 2:
-            _queue_card(col3, queue_items[2][0], queue_stats)
-
-        # Total jobs
-        total_waiting = metrics.get("total_jobs_waiting", 0)
-        total_processing = metrics.get("total_jobs_processing", 0)
-        total_in_system = metrics.get("total_jobs_in_system", total_waiting + total_processing)
-
-        t1, t2, t3 = st.columns(3)
-        with t1:
-            st.metric("Total Waiting", f"{total_waiting}", label_visibility="visible")
-        with t2:
-            st.metric("Total Processing", f"{total_processing}", label_visibility="visible")
-        with t3:
-            st.metric("Total In System", f"{total_in_system}", label_visibility="visible")
 
         # Chart - Responsive stacked bar showing waiting + in-flight
         if queues or queue_stats:
@@ -293,11 +230,11 @@ def render_queue_metrics():
                         "Queue": queue_name.replace("jobs.", "").upper(),
                         "Waiting": stats.get("ready", 0),
                         "Processing": stats.get("unacked", 0),
+                        "Completed": stats.get("completed", 0),
                         "Total": stats.get("total", 0),
                         "Consumers": stats.get("consumers", 0),
                     }
                 )
-            st.markdown("#### Per-Queue Runtime Stats")
             st.dataframe(per_queue_rows, use_container_width=True, hide_index=True)
     else:
         st.warning("⚠️ Unable to fetch metrics from API")
@@ -349,6 +286,7 @@ def render_compact_queue_metrics(
                 "Queue": q.replace("jobs.", "").upper(),
                 "Waiting": stats.get("ready", 0),
                 "Processing": stats.get("unacked", 0),
+                "Completed": stats.get("completed", 0),
             }
             for q, stats in queue_stats.items()
         ]

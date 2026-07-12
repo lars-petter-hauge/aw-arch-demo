@@ -473,12 +473,15 @@ def _fetch_queue_stats_from_management(queue_name: str) -> Dict[str, int]:
     ready = int(payload.get("messages_ready", payload.get("messages", 0)))
     unacked = int(payload.get("messages_unacknowledged", 0))
     consumers = int(payload.get("consumers", 0))
+    message_stats = payload.get("message_stats", {})
+    completed = int(message_stats.get("ack", 0))
 
     return {
         "ready": ready,
         "unacked": unacked,
         "total": ready + unacked,
         "consumers": consumers,
+        "completed": completed,
     }
 
 
@@ -499,6 +502,7 @@ async def get_queue_runtime_stats(queue_name: str) -> Dict[str, int]:
             "unacked": 0,
             "total": ready,
             "consumers": 0,
+            "completed": 0,
         }
 
 
@@ -519,9 +523,9 @@ async def get_metrics():
             "jobs.worker_c": 8
         },
         "queue_stats": {
-            "jobs.worker_a": {"ready": 5, "unacked": 2, "total": 7, "consumers": 1},
-            "jobs.worker_b": {"ready": 3, "unacked": 1, "total": 4, "consumers": 1},
-            "jobs.worker_c": {"ready": 8, "unacked": 0, "total": 8, "consumers": 1}
+            "jobs.worker_a": {"ready": 5, "unacked": 2, "total": 7, "consumers": 1, "completed": 120},
+            "jobs.worker_b": {"ready": 3, "unacked": 1, "total": 4, "consumers": 1, "completed": 98},
+            "jobs.worker_c": {"ready": 8, "unacked": 0, "total": 8, "consumers": 1, "completed": 45}
         },
         "total_jobs_waiting": 16,
         "total_jobs_processing": 3,
