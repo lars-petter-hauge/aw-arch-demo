@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aw-messaging"
+version = "0.1.0"
+description = "Shared messaging transports for API and workers"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = ["messaging"]
+
+[tool.setuptools.package-dir]
+messaging = "."

@@ -7,11 +7,12 @@ import time
 import base64
 import urllib.request
 import urllib.parse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-import aio_pika
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
+
+from messaging import ApiTransport, create_api_transport
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +21,8 @@ app = FastAPI(title="AW Arch Demo API")
 
 # Configuration
 BROKER_URL = os.getenv("BROKER_URL", "amqp://guest:guest@rabbitmq:5672/")
+TRANSPORT_BACKEND = os.getenv("TRANSPORT_BACKEND", "").strip().lower()
+RESULTS_QUEUE = os.getenv("RESULTS_QUEUE", "jobs.results")
 RABBITMQ_MGMT_URL = os.getenv("RABBITMQ_MGMT_URL", "http://rabbitmq:15672")
 RABBITMQ_MGMT_USER = os.getenv("RABBITMQ_MGMT_USER", "guest")
 RABBITMQ_MGMT_PASS = os.getenv("RABBITMQ_MGMT_PASS", "guest")
@@ -37,157 +40,45 @@ AVAILABLE_WORKERS = ["worker_a", "worker_b", "worker_c"]
 # In-memory result storage (POC - simple dictionary for demonstration)
 results_store: Dict[str, Dict[str, Any]] = {}
 
-# AMQP connection pool
-amqp_connection = None
-amqp_channel = None
-amqp_exchange = None
-
-
 class PipelineRequest(BaseModel):
     """Request body for pipeline execution."""
     models: List[str] = ["worker_a", "worker_b"]  # Model names in sequence
     simulations: int = 10  # Number of independent simulations
 
 
-async def get_amqp_connection():
-    """Get or create AMQP connection."""
-    global amqp_connection
-    if amqp_connection is None or amqp_connection.is_closed:
-        amqp_connection = await aio_pika.connect_robust(BROKER_URL)
-    return amqp_connection
+api_transport: Optional[ApiTransport] = None
 
 
-async def get_amqp_channel():
-    """Get or create AMQP channel."""
-    global amqp_channel
-    if amqp_channel is None or amqp_channel.is_closed:
-        conn = await get_amqp_connection()
-        amqp_channel = await conn.channel()
-    return amqp_channel
-
-
-async def get_amqp_exchange():
-    """Get or create AMQP exchange."""
-    global amqp_exchange
-    if amqp_exchange is None:
-        channel = await get_amqp_channel()
-        amqp_exchange = await channel.get_exchange("jobs")
-    return amqp_exchange
-
-
-async def setup_amqp_infrastructure():
-    """Initialize AMQP exchange and queues once at startup."""
-    try:
-        logger.info("Setting up AMQP infrastructure...")
-        conn = await get_amqp_connection()
-        channel = await get_amqp_channel()
-        
-        # Create exchange
-        global amqp_exchange
-        amqp_exchange = await channel.declare_exchange(
-            "jobs", aio_pika.ExchangeType.DIRECT, durable=True
+def get_transport() -> ApiTransport:
+    global api_transport
+    if api_transport is None:
+        api_transport = create_api_transport(
+            BROKER_URL,
+            RESULTS_QUEUE,
+            transport_backend=TRANSPORT_BACKEND,
+            queue_stats_provider=_fetch_queue_stats_from_management,
         )
-        logger.info("Exchange 'jobs' created")
-        
-        # Create queues for all workers
-        for worker in AVAILABLE_WORKERS:
-            queue_name = f"jobs.{worker}"
-            queue = await channel.declare_queue(queue_name, durable=True)
-            await queue.bind(amqp_exchange, queue_name)
-            logger.info(f"Queue '{queue_name}' created and bound to exchange")
-        
-        logger.info("AMQP infrastructure setup complete")
-    except Exception as e:
-        logger.error(f"Error setting up AMQP infrastructure: {e}", exc_info=True)
-        raise
+    return api_transport
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize AMQP infrastructure on app startup."""
-    await setup_amqp_infrastructure()
+    """Initialize messaging infrastructure on app startup."""
+    await get_transport().startup(AVAILABLE_WORKERS)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Close AMQP connection on app shutdown."""
-    global amqp_connection, amqp_channel
-    if amqp_channel:
-        await amqp_channel.close()
-    if amqp_connection:
-        await amqp_connection.close()
-    logger.info("AMQP connection closed")
-
-
-async def publish_job(
-    channel: aio_pika.Channel,
-    model_name: str,
-    job_data: dict,
-    reply_to: str = None,
-    correlation_id: str = None,
-):
-    """Publish a job to AMQP exchange.
-    
-    Args:
-        channel: AMQP channel
-        model_name: Name of the worker model (e.g., 'worker_a')
-        job_data: Job data dictionary
-        reply_to: Reply queue name for RPC
-        correlation_id: Correlation ID for RPC matching
-    """
-    queue_name = f"jobs.{model_name}"
-    exchange = await get_amqp_exchange()
-    message = aio_pika.Message(
-        body=json.dumps(job_data).encode(),
-        content_type="application/json",
-        reply_to=reply_to,
-        correlation_id=correlation_id,
-    )
-    await exchange.publish(message, routing_key=queue_name)
-
-
-async def wait_for_result(
-    reply_queue: aio_pika.Queue, correlation_id: str, timeout: float = 120.0
-):
-    """Wait for a result from the reply queue matching the correlation_id.
-    
-    Args:
-        reply_queue: Reply queue to listen on
-        correlation_id: Correlation ID to match
-        timeout: Maximum time to wait in seconds
-        
-    Returns:
-        Result dictionary or timeout dict
-    """
-    start_time = time.time()
-    
-    async with reply_queue.iterator() as queue_iter:
-        async for message in queue_iter:
-            async with message.process():
-                # Check if this message matches our correlation_id
-                if message.correlation_id == correlation_id:
-                    result = json.loads(message.body.decode())
-                    logger.debug(f"Received result for correlation_id {correlation_id}")
-                    return result
-                else:
-                    # Log unexpected message and continue
-                    logger.warning(
-                        f"Received message with unexpected correlation_id: "
-                        f"{message.correlation_id}, expected {correlation_id}"
-                    )
-            
-            # Check timeout
-            if time.time() - start_time > timeout:
-                return {"status": "timeout"}
-    
-    return {"status": "timeout"}
+    """Close messaging connection on app shutdown."""
+    transport = get_transport()
+    await transport.shutdown()
+    logger.info("Messaging transport closed")
 
 
 async def run_simulation_pipeline(
     pipeline_id: str,
     simulation_id: int,
     models: List[str],
-    channel: aio_pika.Channel,
     state_key: str,
 ):
     """
@@ -203,11 +94,7 @@ async def run_simulation_pipeline(
         simulation_results = {}
         previous_result = None
 
-        # Use a dedicated exclusive reply queue per simulation to avoid
-        # concurrent consumers stealing each other's RPC replies.
-        reply_queue = await channel.declare_queue(
-            "", durable=False, exclusive=True, auto_delete=False
-        )
+        transport = get_transport()
 
         for step_index, model in enumerate(models):
             job_id = str(uuid.uuid4())
@@ -226,13 +113,7 @@ async def run_simulation_pipeline(
                 job_data["input"] = previous_result
 
             # Publish job to queue with RPC metadata
-            await publish_job(
-                channel,
-                model,
-                job_data,
-                reply_to=reply_queue.name,
-                correlation_id=correlation_id,
-            )
+            await transport.publish_job(model, job_data, correlation_id)
             logger.info(
                 f"Pipeline {pipeline_id}: Published simulation {simulation_id} "
                 f"to model {model} (step {step_index + 1}/{len(models)})"
@@ -242,7 +123,7 @@ async def run_simulation_pipeline(
             timeout = WORKER_TIMEOUTS.get(model, 120.0)
             
             # Wait for THIS simulation's result for this model
-            result = await wait_for_result(reply_queue, correlation_id, timeout=timeout)
+            result = await transport.wait_for_result(correlation_id, timeout=timeout)
             simulation_results[model] = result
             previous_result = result
             
@@ -287,9 +168,6 @@ async def run_pipeline(
     enabling true asynchronous pipelining.
     """
     try:
-        # Get pre-initialized channel (queues already exist)
-        channel = await get_amqp_channel()
-
         # Initialize pipeline state
         state_key = f"pipeline:{pipeline_id}"
         state = {
@@ -309,7 +187,7 @@ async def run_pipeline(
         
         tasks = [
             run_simulation_pipeline(
-                pipeline_id, sim_id, models, channel, state_key
+                pipeline_id, sim_id, models, state_key
             )
             for sim_id in range(1, simulations + 1)
         ]
@@ -442,14 +320,7 @@ async def get_queue_depth(queue_name: str) -> int:
     Returns:
         Number of messages in the queue
     """
-    try:
-        channel = await get_amqp_channel()
-        # Passive declare reads queue metadata without creating/changing queue.
-        declaration = await channel.declare_queue(queue_name, passive=True)
-        return declaration.declaration_result.message_count
-    except Exception as e:
-        logger.warning(f"Could not get queue depth for {queue_name}: {e}")
-        return 0
+    return await get_transport().get_queue_depth(queue_name)
 
 
 def _fetch_queue_stats_from_management(queue_name: str) -> Dict[str, int]:
@@ -490,20 +361,7 @@ async def get_queue_runtime_stats(queue_name: str) -> Dict[str, int]:
 
     Falls back to AMQP queue depth if management API is unavailable.
     """
-    try:
-        return await asyncio.to_thread(_fetch_queue_stats_from_management, queue_name)
-    except Exception as e:
-        logger.warning(
-            f"Could not get runtime stats from management API for {queue_name}: {e}"
-        )
-        ready = await get_queue_depth(queue_name)
-        return {
-            "ready": ready,
-            "unacked": 0,
-            "total": ready,
-            "consumers": 0,
-            "completed": 0,
-        }
+    return await get_transport().get_queue_runtime_stats(queue_name)
 
 
 @app.get("/metrics")

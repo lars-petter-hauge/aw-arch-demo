@@ -9,7 +9,8 @@ spec:
         from: feature/async-worker-architecture
   components:
     - name: api
-      src: api
+      src: .
+      dockerfileName: api/Dockerfile
       ports:
         - name: http
           port: 8000
@@ -17,7 +18,8 @@ spec:
       secrets:
         - BROKER_URL
     - name: worker-a
-      src: worker_a
+      src: .
+      dockerfileName: worker_a/Dockerfile
       secrets:
         - BROKER_URL
       horizontalScaling:
@@ -31,7 +33,8 @@ spec:
               activationMessageCount: 1
               connectionFromEnv: BROKER_URL
     - name: worker-b
-      src: worker_b
+      src: .
+      dockerfileName: worker_b/Dockerfile
       secrets:
         - BROKER_URL
       horizontalScaling:

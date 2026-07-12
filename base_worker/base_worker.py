@@ -1,14 +1,13 @@
 """Base worker module for AMQP job processing."""
 import asyncio
-import json
 import time
 import logging
 import os
 import random
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Dict, Any, Optional
 
-import aio_pika
+from messaging import WorkerTransport, create_worker_transport
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +21,7 @@ class WorkerConfig:
         queue_name: str,
         target_duration: float,
         broker_url: Optional[str] = None,
+        transport_backend: Optional[str] = None,
     ):
         self.worker_name = worker_name
         self.queue_name = queue_name
@@ -29,6 +29,14 @@ class WorkerConfig:
         self.broker_url = broker_url or os.getenv(
             "BROKER_URL", "amqp://guest:guest@rabbitmq:5672/"
         )
+        env_backend = os.getenv("TRANSPORT_BACKEND", "").strip().lower()
+        chosen_backend = transport_backend or env_backend
+        if chosen_backend in {"rabbitmq", "servicebus"}:
+            self.transport_backend = chosen_backend
+        elif self.broker_url.startswith("Endpoint="):
+            self.transport_backend = "servicebus"
+        else:
+            self.transport_backend = "rabbitmq"
 
 
 class BaseWorker(ABC):
@@ -49,8 +57,11 @@ class BaseWorker(ABC):
         """
         self.config = config
         self.logger = logging.getLogger(f"worker.{config.worker_name}")
-        self.connection: Optional[aio_pika.RobustConnection] = None
-        self.channel: Optional[aio_pika.Channel] = None
+        self.transport: WorkerTransport = create_worker_transport(
+            self.config.broker_url,
+            self.config.queue_name,
+            self.config.transport_backend,
+        )
 
     @staticmethod
     def cpu_burn(duration: float) -> float:
@@ -95,116 +106,36 @@ class BaseWorker(ABC):
         """
         pass
 
-    async def process_message(
-        self, message: aio_pika.IncomingMessage
-    ) -> None:
-        """Process a single job from the queue.
+    async def _handle_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute worker-specific logic for a single parsed job payload."""
+        job_id = job["job_id"]
+        simulation = job.get("simulation", 0)
+        iteration = job.get("iteration", 0)
 
-        Args:
-            message: AMQP message containing job data.
-        """
-        async with message.process():
-            try:
-                job = json.loads(message.body.decode())
-                job_id = job["job_id"]
-                simulation = job.get("simulation", 0)
-                iteration = job.get("iteration", 0)
-
-                self.logger.info(
-                    f"Processing job {job_id} "
-                    f"(simulation: {simulation}, iteration: {iteration})"
-                )
-
-                # Perform work
-                result = await self.do_work(job)
-
-                self.logger.info(
-                    f"Completed job {job_id} in {result.get('cpu_seconds', 0):.2f}s"
-                )
-
-                # If reply_to queue is specified, send result back to API
-                if message.reply_to:
-                    await self._send_result(result, message)
-
-                # Message is automatically acknowledged after process() context
-            except Exception as e:
-                self.logger.error(f"Error processing message: {e}", exc_info=True)
-                # message.nack(requeue=True) called on exception within process()
-
-    async def _send_result(
-        self, result: Dict[str, Any], original_message: aio_pika.IncomingMessage
-    ) -> None:
-        """Send result back to API via reply_to queue.
-
-        Args:
-            result: Result dictionary from do_work()
-            original_message: Original AMQP message containing reply_to and correlation_id
-        """
-        try:
-            # Reply queues are addressed by name via the default exchange.
-            exchange = self.channel.default_exchange
-            
-            # Create reply message with correlation_id to match request
-            reply_message = aio_pika.Message(
-                body=json.dumps(result).encode(),
-                content_type="application/json",
-                correlation_id=original_message.correlation_id,
-            )
-            
-            # Publish result back to API's reply queue
-            await exchange.publish(
-                reply_message,
-                routing_key=original_message.reply_to,
-            )
-            
-            self.logger.debug(
-                f"Sent result for job {result.get('job_id')} "
-                f"to {original_message.reply_to}"
-            )
-        except Exception as e:
-            self.logger.error(
-                f"Failed to send result for job {result.get('job_id')}: {e}",
-                exc_info=True
-            )
-
-    async def setup_amqp(self) -> None:
-        """Setup AMQP connection, exchange, and queue."""
-        self.logger.info(f"Connecting to {self.config.broker_url}")
-        self.connection = await aio_pika.connect_robust(self.config.broker_url)
-        self.channel = await self.connection.channel()
-
-        # Declare exchange and queue
-        exchange = await self.channel.declare_exchange(
-            "jobs", aio_pika.ExchangeType.DIRECT, durable=True
+        self.logger.info(
+            f"Processing job {job_id} "
+            f"(simulation: {simulation}, iteration: {iteration})"
         )
-        queue = await self.channel.declare_queue(
-            self.config.queue_name, durable=True
-        )
-        await queue.bind(exchange, self.config.queue_name)
 
-        self.logger.info(f"Queue '{self.config.queue_name}' ready")
+        result = await self.do_work(job)
+
+        self.logger.info(
+            f"Completed job {job_id} in {result.get('cpu_seconds', 0):.2f}s"
+        )
+        return result
 
     async def run(self) -> None:
         """Main worker loop - connect and process messages."""
         try:
-            await self.setup_amqp()
-
             self.logger.info(
                 f"Worker '{self.config.worker_name}' listening on "
                 f"'{self.config.queue_name}'"
             )
-
-            # Setup consumer with prefetch
-            await self.channel.set_qos(prefetch_count=1)
-            queue = await self.channel.get_queue(self.config.queue_name)
-            async with queue.iterator() as queue_iter:
-                async for message in queue_iter:
-                    await self.process_message(message)
+            await self.transport.run(self._handle_job)
         except Exception as e:
             self.logger.error(f"Worker error: {e}", exc_info=True)
         finally:
-            if self.connection:
-                await self.connection.close()
+            await self.transport.shutdown()
             self.logger.info("Worker shutdown complete")
 
     def start(self) -> None:

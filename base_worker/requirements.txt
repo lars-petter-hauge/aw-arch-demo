@@ -1,1 +1,2 @@
 aio-pika==10.0.1
+azure-servicebus==7.12.2
