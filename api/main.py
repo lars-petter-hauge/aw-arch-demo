@@ -189,7 +189,6 @@ async def run_simulation_pipeline(
     models: List[str],
     channel: aio_pika.Channel,
     state_key: str,
-    reply_queue: aio_pika.Queue,
 ):
     """
     Run a single simulation through the pipeline.
@@ -203,6 +202,12 @@ async def run_simulation_pipeline(
     try:
         simulation_results = {}
         previous_result = None
+
+        # Use a dedicated exclusive reply queue per simulation to avoid
+        # concurrent consumers stealing each other's RPC replies.
+        reply_queue = await channel.declare_queue(
+            "", durable=False, exclusive=True, auto_delete=False
+        )
 
         for step_index, model in enumerate(models):
             job_id = str(uuid.uuid4())
@@ -285,14 +290,6 @@ async def run_pipeline(
         # Get pre-initialized channel (queues already exist)
         channel = await get_amqp_channel()
 
-        # Create a unique reply queue for this pipeline
-        # All simulations in this pipeline share the same reply queue
-        reply_queue_name = f"pipeline.reply.{pipeline_id}"
-        reply_queue = await channel.declare_queue(
-            reply_queue_name, durable=False, exclusive=False
-        )
-        logger.info(f"Created reply queue: {reply_queue_name}")
-
         # Initialize pipeline state
         state_key = f"pipeline:{pipeline_id}"
         state = {
@@ -312,17 +309,13 @@ async def run_pipeline(
         
         tasks = [
             run_simulation_pipeline(
-                pipeline_id, sim_id, models, channel, state_key, reply_queue
+                pipeline_id, sim_id, models, channel, state_key
             )
             for sim_id in range(1, simulations + 1)
         ]
         
         # Run all simulations concurrently
         await asyncio.gather(*tasks)
-        
-        # Clean up reply queue
-        await reply_queue.delete()
-        logger.info(f"Deleted reply queue: {reply_queue_name}")
         
         # Update state to completed
         state["status"] = "completed"

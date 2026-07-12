@@ -141,7 +141,8 @@ class BaseWorker(ABC):
             original_message: Original AMQP message containing reply_to and correlation_id
         """
         try:
-            exchange = await self.channel.get_exchange("jobs")
+            # Reply queues are addressed by name via the default exchange.
+            exchange = self.channel.default_exchange
             
             # Create reply message with correlation_id to match request
             reply_message = aio_pika.Message(
