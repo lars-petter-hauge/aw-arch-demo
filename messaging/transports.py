@@ -43,6 +43,13 @@ def servicebus_body_to_bytes(message: Any) -> bytes:
     return b"".join(chunks)
 
 
+def _require_servicebus_sdk() -> None:
+    if ServiceBusClient is None or ServiceBusMessage is None:
+        raise RuntimeError(
+            "azure-servicebus is not installed. Add it to requirements to use servicebus backend."
+        )
+
+
 class ApiTransport(ABC):
     @abstractmethod
     async def startup(self, workers: List[str]) -> None:
@@ -76,13 +83,57 @@ class ApiTransport(ABC):
         }
 
 
-class RabbitApiTransport(ApiTransport):
+class BaseApiTransport(ApiTransport):
+    def __init__(self) -> None:
+        self.pending: Dict[str, asyncio.Future] = {}
+        self.consumer_task: Optional[asyncio.Task] = None
+
+    async def shutdown(self) -> None:
+        if self.consumer_task:
+            self.consumer_task.cancel()
+            try:
+                await self.consumer_task
+            except asyncio.CancelledError:
+                pass
+
+        for future in self.pending.values():
+            if not future.done():
+                future.cancel()
+        self.pending.clear()
+
+        await self._shutdown_backend()
+
+    async def wait_for_result(self, correlation_id: str, timeout: float) -> Dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.pending[correlation_id] = future
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"status": "timeout"}
+        finally:
+            self.pending.pop(correlation_id, None)
+
+    def _resolve_pending(self, correlation_id: Optional[str], payload: Dict[str, Any]) -> None:
+        if not correlation_id:
+            return
+        future = self.pending.get(correlation_id)
+        if future and not future.done():
+            future.set_result(payload)
+
+    @abstractmethod
+    async def _shutdown_backend(self) -> None:
+        raise NotImplementedError
+
+
+class RabbitApiTransport(BaseApiTransport):
     def __init__(
         self,
         broker_url: str,
         results_queue: str,
         queue_stats_provider: Optional[Callable[[str], Dict[str, int]]] = None,
     ):
+        super().__init__()
         self.broker_url = broker_url
         self.results_queue = results_queue
         self.queue_stats_provider = queue_stats_provider
@@ -90,8 +141,6 @@ class RabbitApiTransport(ApiTransport):
         self.channel: Optional[aio_pika.Channel] = None
         self.exchange: Optional[aio_pika.Exchange] = None
         self.reply_queue: Optional[aio_pika.Queue] = None
-        self.pending: Dict[str, asyncio.Future] = {}
-        self.consumer_task: Optional[asyncio.Task] = None
 
     async def startup(self, workers: List[str]) -> None:
         self.connection = await aio_pika.connect_robust(self.broker_url)
@@ -108,19 +157,7 @@ class RabbitApiTransport(ApiTransport):
         self.reply_queue = await self.channel.declare_queue(self.results_queue, durable=True)
         self.consumer_task = asyncio.create_task(self._consume_results())
 
-    async def shutdown(self) -> None:
-        if self.consumer_task:
-            self.consumer_task.cancel()
-            try:
-                await self.consumer_task
-            except asyncio.CancelledError:
-                pass
-
-        for future in self.pending.values():
-            if not future.done():
-                future.cancel()
-        self.pending.clear()
-
+    async def _shutdown_backend(self) -> None:
         if self.channel and not self.channel.is_closed:
             await self.channel.close()
         if self.connection and not self.connection.is_closed:
@@ -139,17 +176,6 @@ class RabbitApiTransport(ApiTransport):
         )
         await self.exchange.publish(message, routing_key=queue_name)
 
-    async def wait_for_result(self, correlation_id: str, timeout: float) -> Dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self.pending[correlation_id] = future
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            return {"status": "timeout"}
-        finally:
-            self.pending.pop(correlation_id, None)
-
     async def _consume_results(self) -> None:
         if not self.reply_queue:
             return
@@ -162,13 +188,7 @@ class RabbitApiTransport(ApiTransport):
                         payload = json.loads(message.body.decode())
                     except Exception:
                         continue
-
-                    if not correlation_id:
-                        continue
-
-                    future = self.pending.get(correlation_id)
-                    if future and not future.done():
-                        future.set_result(payload)
+                    self._resolve_pending(correlation_id, payload)
 
     async def get_queue_depth(self, queue_name: str) -> int:
         if not self.channel:
@@ -188,19 +208,15 @@ class RabbitApiTransport(ApiTransport):
             return await super().get_queue_runtime_stats(queue_name)
 
 
-class ServiceBusApiTransport(ApiTransport):
+class ServiceBusApiTransport(BaseApiTransport):
     def __init__(self, connection_string: str, results_queue: str):
-        if ServiceBusClient is None or ServiceBusMessage is None:
-            raise RuntimeError(
-                "azure-servicebus is not installed. Add it to requirements to use servicebus backend."
-            )
+        _require_servicebus_sdk()
+        super().__init__()
         self.connection_string = connection_string
         self.results_queue = results_queue
         self.client: Optional[ServiceBusClient] = None
         self.senders: Dict[str, Any] = {}
         self.receiver: Any = None
-        self.pending: Dict[str, asyncio.Future] = {}
-        self.consumer_task: Optional[asyncio.Task] = None
 
     async def startup(self, workers: List[str]) -> None:
         self.client = ServiceBusClient.from_connection_string(self.connection_string)
@@ -210,19 +226,7 @@ class ServiceBusApiTransport(ApiTransport):
         self.receiver = self.client.get_queue_receiver(queue_name=self.results_queue)
         self.consumer_task = asyncio.create_task(self._consume_results())
 
-    async def shutdown(self) -> None:
-        if self.consumer_task:
-            self.consumer_task.cancel()
-            try:
-                await self.consumer_task
-            except asyncio.CancelledError:
-                pass
-
-        for future in self.pending.values():
-            if not future.done():
-                future.cancel()
-        self.pending.clear()
-
+    async def _shutdown_backend(self) -> None:
         for sender in self.senders.values():
             await sender.close()
         self.senders.clear()
@@ -246,17 +250,6 @@ class ServiceBusApiTransport(ApiTransport):
         )
         await sender.send_messages(message)
 
-    async def wait_for_result(self, correlation_id: str, timeout: float) -> Dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self.pending[correlation_id] = future
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            return {"status": "timeout"}
-        finally:
-            self.pending.pop(correlation_id, None)
-
     async def _consume_results(self) -> None:
         if not self.receiver:
             return
@@ -277,10 +270,7 @@ class ServiceBusApiTransport(ApiTransport):
                     await self.receiver.complete_message(message)
                     continue
 
-                if correlation_id:
-                    future = self.pending.get(correlation_id)
-                    if future and not future.done():
-                        future.set_result(payload)
+                self._resolve_pending(correlation_id, payload)
 
                 await self.receiver.complete_message(message)
 
@@ -338,10 +328,7 @@ class RabbitWorkerTransport(WorkerTransport):
 
 class ServiceBusWorkerTransport(WorkerTransport):
     def __init__(self, connection_string: str, queue_name: str):
-        if ServiceBusClient is None or ServiceBusMessage is None:
-            raise RuntimeError(
-                "azure-servicebus is not installed. Add it to requirements to use servicebus backend."
-            )
+        _require_servicebus_sdk()
         self.connection_string = connection_string
         self.queue_name = queue_name
         self.client: Optional[ServiceBusClient] = None
