@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 
 from messaging import WorkerTransport, create_worker_transport
+from messaging.transports import HEARTBEAT_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,19 @@ class BaseWorker(ABC):
     """Abstract base class for AMQP workers.
 
     Subclasses must implement do_work() to define worker-specific computation.
-    All common logic (AMQP connection, message processing) is handled here.
-    
+    All common logic (AMQP connection, message processing, heartbeat) is
+    handled here.
+
+    Heartbeat:
+        On startup a background asyncio task begins publishing a heartbeat
+        message to the 'heartbeat' fanout exchange every HEARTBEAT_INTERVAL
+        seconds. The API subscribes to this exchange and uses the heartbeats
+        to determine whether a worker is currently warm before submitting a
+        job, allowing it to apply an appropriate cold-start timeout rather
+        than the normal (shorter) job timeout.
+
     Note: Result storage is handled by the API, not the worker.
-    Workers only need to process jobs and return results in the message ack/nack.
+    Workers only need to process jobs and return results via message reply.
     """
 
     def __init__(self, config: WorkerConfig):
@@ -62,6 +72,7 @@ class BaseWorker(ABC):
             self.config.queue_name,
             self.config.transport_backend,
         )
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     @staticmethod
     def cpu_burn(duration: float) -> float:
@@ -124,6 +135,25 @@ class BaseWorker(ABC):
         )
         return result
 
+    async def _heartbeat_loop(self) -> None:
+        """Publish a heartbeat to the broker on a fixed interval.
+
+        This runs as a background task alongside the main job consumer loop.
+        The heartbeat lets the API know this worker is alive and warm, so the
+        API can skip the cold-start timeout budget for jobs submitted while
+        this worker is running.
+
+        The loop publishes immediately on first call (so the API sees the
+        worker as warm as soon as it connects) and then every
+        HEARTBEAT_INTERVAL seconds thereafter.
+        """
+        while True:
+            await self.transport.publish_heartbeat(self.config.worker_name)
+            self.logger.debug(
+                f"Heartbeat published for worker '{self.config.worker_name}'"
+            )
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+
     async def run(self) -> None:
         """Main worker loop - connect and process messages."""
         try:
@@ -131,10 +161,21 @@ class BaseWorker(ABC):
                 f"Worker '{self.config.worker_name}' listening on "
                 f"'{self.config.queue_name}'"
             )
+
+            # Start the heartbeat background task. It runs concurrently with
+            # the job consumer so the broker always knows this worker is alive.
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
             await self.transport.run(self._handle_job)
         except Exception as e:
             self.logger.error(f"Worker error: {e}", exc_info=True)
         finally:
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
             await self.transport.shutdown()
             self.logger.info("Worker shutdown complete")
 
