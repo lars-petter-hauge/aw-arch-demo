@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aio_pika
@@ -12,6 +13,44 @@ try:
 except ImportError:
     ServiceBusMessage = None
     ServiceBusClient = None
+
+
+# ---------------------------------------------------------------------------
+# Alternative: Redis-based heartbeat
+# ---------------------------------------------------------------------------
+# Instead of using AMQP for worker heartbeats, Redis TTL keys could be used:
+#
+#   Worker side:
+#       await redis.set(f"worker:heartbeat:{worker_name}", timestamp, ex=15)
+#
+#   API side:
+#       is_warm = await redis.exists(f"worker:heartbeat:{worker_name}")
+#
+# Pros of Redis approach:
+#   + Keys auto-expire (TTL) — no manual stale detection needed; if the worker
+#     dies the key simply disappears after `ex` seconds with zero cleanup code.
+#   + Shared state across all API replicas — every instance sees the same
+#     heartbeat data without each needing its own AMQP consumer.
+#   + Simpler consumer code — a single EXISTS/GET call vs. a background
+#     asyncio task consuming from a fanout exchange.
+#   + Survives API restarts — Redis persists the heartbeat state, so a freshly
+#     restarted API instance immediately knows which workers are warm.
+#
+# Cons of Redis approach:
+#   + Adds a new dependency pattern — even though Redis already exists in this
+#     stack for result caching, mixing signalling semantics into the cache layer
+#     conflates two concerns and makes Redis harder to replace or remove later.
+#   + Not portable — if Redis is swapped out (e.g. for a managed alternative
+#     without pub/sub or TTL support) the heartbeat mechanism breaks silently.
+#   + Polling model — the API must actively query Redis; with AMQP the broker
+#     pushes heartbeats to the API, which is more event-driven.
+#
+# The AMQP fanout approach chosen here keeps all messaging in one place and
+# avoids adding a second signalling channel to the architecture.
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_EXCHANGE = "heartbeat"
+HEARTBEAT_INTERVAL = 5  # seconds between worker heartbeat publishes
 
 
 def detect_backend(broker_url: str, transport_backend: str = "") -> str:
@@ -127,6 +166,22 @@ class BaseApiTransport(ApiTransport):
 
 
 class RabbitApiTransport(BaseApiTransport):
+    """
+    API-side AMQP transport using RabbitMQ.
+
+    In addition to job publishing and result consumption, this transport
+    subscribes to worker heartbeats via a fanout exchange. Each API instance
+    creates an exclusive, auto-delete queue bound to the 'heartbeat' fanout
+    exchange. This means:
+      - No message accumulation: the queue vanishes when the API disconnects.
+      - Multiple API replicas each receive every heartbeat independently.
+      - No manual cleanup required.
+
+    Heartbeat messages are used to track which workers are currently warm
+    (i.e. running and connected) so the API can apply an appropriate timeout
+    when submitting jobs (see is_worker_warm() in main.py).
+    """
+
     def __init__(
         self,
         broker_url: str,
@@ -141,6 +196,10 @@ class RabbitApiTransport(BaseApiTransport):
         self.channel: Optional[aio_pika.Channel] = None
         self.exchange: Optional[aio_pika.Exchange] = None
         self.reply_queue: Optional[aio_pika.Queue] = None
+        self.heartbeat_task: Optional[asyncio.Task] = None
+
+        # worker_name -> datetime of last received heartbeat
+        self.worker_last_seen: Dict[str, datetime] = {}
 
     async def startup(self, workers: List[str]) -> None:
         self.connection = await aio_pika.connect_robust(self.broker_url)
@@ -157,7 +216,41 @@ class RabbitApiTransport(BaseApiTransport):
         self.reply_queue = await self.channel.declare_queue(self.results_queue, durable=True)
         self.consumer_task = asyncio.create_task(self._consume_results())
 
+        # Subscribe to worker heartbeats via fanout exchange.
+        # The queue is exclusive and auto-delete so it disappears when this
+        # API instance disconnects — no stale queues left in the broker.
+        heartbeat_exchange = await self.channel.declare_exchange(
+            HEARTBEAT_EXCHANGE, aio_pika.ExchangeType.FANOUT, durable=True
+        )
+        heartbeat_queue = await self.channel.declare_queue(
+            "", exclusive=True, auto_delete=True
+        )
+        await heartbeat_queue.bind(heartbeat_exchange)
+        self.heartbeat_task = asyncio.create_task(
+            self._consume_heartbeats(heartbeat_queue)
+        )
+
+    async def _consume_heartbeats(self, queue: aio_pika.Queue) -> None:
+        """Consume heartbeat messages and update worker_last_seen timestamps."""
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                async with message.process():
+                    try:
+                        payload = json.loads(message.body.decode())
+                        worker_name = payload.get("worker")
+                        if worker_name:
+                            self.worker_last_seen[worker_name] = datetime.utcnow()
+                    except Exception:
+                        pass
+
     async def _shutdown_backend(self) -> None:
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
         if self.channel and not self.channel.is_closed:
             await self.channel.close()
         if self.connection and not self.connection.is_closed:
@@ -218,6 +311,12 @@ class ServiceBusApiTransport(BaseApiTransport):
         self.senders: Dict[str, Any] = {}
         self.receiver: Any = None
 
+        # Azure Service Bus does not support a fanout heartbeat pattern in the
+        # same way RabbitMQ does. For Service Bus deployments, worker warmth
+        # detection is not implemented and is_worker_warm() will always return
+        # True (i.e. assume warm, use normal job timeouts).
+        self.worker_last_seen: Dict[str, datetime] = {}
+
     async def startup(self, workers: List[str]) -> None:
         self.client = ServiceBusClient.from_connection_string(self.connection_string)
         for worker in workers:
@@ -271,7 +370,6 @@ class ServiceBusApiTransport(BaseApiTransport):
                     continue
 
                 self._resolve_pending(correlation_id, payload)
-
                 await self.receiver.complete_message(message)
 
 
@@ -284,13 +382,26 @@ class WorkerTransport(ABC):
     async def shutdown(self) -> None:
         raise NotImplementedError
 
+    async def publish_heartbeat(self, worker_name: str) -> None:
+        """Publish a heartbeat signal for this worker. No-op by default."""
+        pass
+
 
 class RabbitWorkerTransport(WorkerTransport):
+    """
+    Worker-side AMQP transport.
+
+    Publishes periodic heartbeat messages to the 'heartbeat' fanout exchange
+    so the API can detect whether a worker is warm before submitting jobs.
+    The heartbeat is a small JSON payload: {"worker": "<name>"}.
+    """
+
     def __init__(self, broker_url: str, queue_name: str):
         self.broker_url = broker_url
         self.queue_name = queue_name
         self.connection: Optional[aio_pika.RobustConnection] = None
         self.channel: Optional[aio_pika.Channel] = None
+        self._heartbeat_exchange: Optional[aio_pika.Exchange] = None
 
     async def run(self, handler: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]) -> None:
         self.connection = await aio_pika.connect_robust(self.broker_url)
@@ -301,6 +412,11 @@ class RabbitWorkerTransport(WorkerTransport):
         )
         queue = await self.channel.declare_queue(self.queue_name, durable=True)
         await queue.bind(exchange, self.queue_name)
+
+        # Declare the heartbeat fanout exchange so we can publish to it.
+        self._heartbeat_exchange = await self.channel.declare_exchange(
+            HEARTBEAT_EXCHANGE, aio_pika.ExchangeType.FANOUT, durable=True
+        )
 
         await self.channel.set_qos(prefetch_count=1)
         async with queue.iterator() as queue_iter:
@@ -318,6 +434,20 @@ class RabbitWorkerTransport(WorkerTransport):
                             reply,
                             routing_key=message.reply_to,
                         )
+
+    async def publish_heartbeat(self, worker_name: str) -> None:
+        """Publish a heartbeat to the fanout exchange for this worker."""
+        if not self._heartbeat_exchange:
+            return
+        try:
+            payload = json.dumps({"worker": worker_name}).encode()
+            message = aio_pika.Message(
+                body=payload,
+                content_type="application/json",
+            )
+            await self._heartbeat_exchange.publish(message, routing_key="")
+        except Exception:
+            pass  # Heartbeat failure is non-fatal
 
     async def shutdown(self) -> None:
         if self.channel and not self.channel.is_closed:
